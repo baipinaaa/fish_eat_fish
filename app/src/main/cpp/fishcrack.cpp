@@ -69,7 +69,9 @@ typedef const Il2CppAssembly** (*pfn_domain_get_assemblies)(const Il2CppDomain*,
 typedef Il2CppImage* (*pfn_assembly_get_image)(const Il2CppAssembly*);
 typedef const char* (*pfn_image_get_name)(const Il2CppImage*);
 typedef Il2CppClass* (*pfn_class_from_name)(const Il2CppImage*, const char*, const char*);
-typedef Il2CppClass* (*pfn_class_get_image)(Il2CppClass*);
+// 注意：返回的是 Il2CppImage*（不是 Il2CppClass*）—— 写错会导致
+// “incompatible pointer types assigning to 'Il2CppImage *' from 'Il2CppClass *'”。
+typedef Il2CppImage* (*pfn_class_get_image)(Il2CppClass*);
 typedef const char* (*pfn_class_get_name)(Il2CppClass*);
 typedef const char* (*pfn_class_get_namespace)(Il2CppClass*);
 typedef FieldInfo* (*pfn_class_get_field_from_name)(Il2CppClass*, const char*);
