@@ -1163,7 +1163,7 @@ static void key_scan_cb(void* obj, void* user) {
         return;
     }
     ++c->seen;
-    Il2CppClass* k = g_api.object_get_class(obj);
+    Il2CppClass* k = g_api.object_get_class((Il2CppObject*)obj);
     if (!k) {
         return;
     }
