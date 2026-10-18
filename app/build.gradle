@@ -8,6 +8,21 @@ android {
     // 与 CI（.github/workflows/build.yml）安装的 NDK 保持一致
     ndkVersion '26.1.10909125'
 
+    // 固定 debug 签名。
+    // 为什么需要：GitHub Actions 每次都是全新环境，没有 ~/.android/debug.keystore，
+    // Gradle 会现场生成一个随机 keystore → 相邻两次产物签名不同，
+    // 手机上覆盖安装会报 INSTALL_FAILED_UPDATE_INCOMPATIBLE。
+    // 这里登记一个随仓库走的固定 keystore，保证 CI 产物可反复覆盖安装。
+    // 注意：它仅用于让安装可重入，**不提供任何安全强度**（密码就在源码里）。
+    signingConfigs {
+        fixed {
+            storeFile file('keystore/fishcrack.jks')
+            storePassword 'fishcrack123'
+            keyAlias 'fishcrack'
+            keyPassword 'fishcrack123'
+        }
+    }
+
     defaultConfig {
         applicationId "com.kunpo.crack"
         minSdk 24
@@ -38,6 +53,7 @@ android {
     buildTypes {
         debug {
             minifyEnabled false
+            signingConfig signingConfigs.fixed
         }
         release {
             minifyEnabled false
