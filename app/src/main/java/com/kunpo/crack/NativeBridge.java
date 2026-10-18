@@ -71,6 +71,21 @@ public final class NativeBridge {
     /** 读 SimplePlayerPrefs 当前的 AES 密钥（静态字段 key）。 */
     private static native String nativePrefsKey();
 
+    /** 读运行时真正生效的 AES key（RijndaelManaged.KeyValue），纯内存读，不调托管方法。 */
+    private static native String nativeDumpKey();
+
+    /** 把运行时 AES key 打到日志；返回 "OK ..." / "WAIT ..." / "ERR ..."。 */
+    public static String dumpKey() {
+        try {
+            String r = nativeDumpKey();
+            XposedBridge.log(TAG + ": ===== 运行时 AES key = " + r);
+            return r;
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": dumpKey 异常: " + t);
+            return "ERR " + t;
+        }
+    }
+
     /** 取当前存档 AES 密钥。返回以 "ERR" 开头表示失败。 */
     public static String prefsKey() {
         if (!libLoaded) {
@@ -135,6 +150,10 @@ public final class NativeBridge {
         }
         // 先把 key 打出来 —— 有了它就能在 PC 上离线解密/加密存档，
         // 不必每改一次都走一遍 native。
+        // 先拿运行时真正生效的 key：provider.KeyValue。
+        // 有了它就能在 PC 上离线解/加密存档（AES-256-ECB，见官方源码）。
+        dumpKey();
+
         String keyStr = prefsKey();
         XposedBridge.log(TAG + ": ===== SimplePlayerPrefs.key = [" + keyStr + "] =====");
         try {

@@ -1128,3 +1128,175 @@ Java_com_kunpo_crack_NativeBridge_nativePrefsKey(JNIEnv* env, jclass clazz) {
     free(buf);
     return r;
 }
+
+// ---------------------------------------------------------------------------
+// 读取运行时真正在用的 AES key
+//
+// 背景（官方 1.1.8 源码，见 work/live/official_all.cs:184715）：
+//   private static string key = ":{j%6j?E:t#}G10mM%9hp5S=%}2,Y26C";
+//   private static RijndaelManaged provider = null;
+//   public static string Msg { set { key = value; } }      // 只改 key，不重建
+//   private static void SetupProvider() {
+//       provider = new RijndaelManaged();
+//       provider.Key = Encoding.ASCII.GetBytes(key);
+//       provider.Mode = CipherMode.ECB;
+//   }
+// 线上存档用默认 key 解不开 ⇒ Msg 被改过且 ResetProvider() 重建了 provider。
+// 静态字段 key 在 HybridCLR 解释类里读不到（v10 实测 null），
+// 但 provider 实例里的 KeyValue 就是真正生效的 32 字节。
+// 下面两条路径**都只读内存，不调用任何托管方法**，所以不会像
+// runtime_invoke 那样把游戏打崩。
+// ---------------------------------------------------------------------------
+
+#define kMaxKeyCand 8
+
+struct KeyScanCtx {
+    void* objs[kMaxKeyCand];
+    int count;
+    int seen;
+};
+
+// il2cpp_gc_foreach_heap 的回调；只比对类名，不做任何分配。
+static void key_scan_cb(void* obj, void* user) {
+    KeyScanCtx* c = (KeyScanCtx*)user;
+    if (!obj || c->count >= kMaxKeyCand) {
+        return;
+    }
+    ++c->seen;
+    Il2CppClass* k = g_api.object_get_class(obj);
+    if (!k) {
+        return;
+    }
+    const char* nm = g_api.class_get_name(k);
+    if (!nm) {
+        return;
+    }
+    // SimplePlayerPrefs.provider 的运行时类型就是 RijndaelManaged
+    if (strcmp(nm, "RijndaelManaged") == 0) {
+        c->objs[c->count++] = obj;
+    }
+}
+
+// 从 RijndaelManaged 实例里把 KeyValue(byte[]) 的字节打印成 hex
+static bool key_from_cipher_obj(void* provObj, char* hex, int hexSize, char* asc, int ascSize) {
+    Il2CppDomain* dom = g_api.domain_get();
+    if (!dom || !provObj) {
+        return false;
+    }
+    Il2CppClass* sa = find_class_ns_name(dom, "System.Security.Cryptography", "SymmetricAlgorithm");
+    if (!sa) {
+        return false;
+    }
+    FieldInfo* fKey = g_api.class_get_field_from_name(sa, "KeyValue");
+    if (!fKey) {
+        return false;
+    }
+    const size_t offKey = g_api.field_get_offset(fKey);
+    void* arr = *(void**)((char*)provObj + (ptrdiff_t)offKey);
+    if (!arr) {
+        return false;
+    }
+    // il2cpp 单维数组布局：klass(8) monitor(8) bounds(8) max_length(8) data[]
+    unsigned long long len = *(unsigned long long*)((char*)arr + 0x18);
+    const unsigned char* data = (const unsigned char*)arr + 0x20;
+    if (len == 0 || len > 64) {
+        return false;
+    }
+    if ((int)(len * 3 + 1) > hexSize || (int)len + 1 > ascSize) {
+        return false;
+    }
+    for (unsigned long long i = 0; i < len; ++i) {
+        snprintf(hex + i * 3, 4, "%02x", data[i]);
+        asc[i] = (data[i] >= 32 && data[i] < 127) ? (char)data[i] : '.';
+    }
+    hex[len * 3] = '\0';
+    asc[len] = '\0';
+    return true;
+}
+
+/**
+ * 返回字符串以状态码开头：
+ *   "OK"   —— 拿到了 key（hex/ascii 可直接离线解存档）
+ *   "WAIT" —— il2cpp 还没就绪
+ *   "ERR"  —— 硬错误
+ */
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_kunpo_crack_NativeBridge_nativeDumpKey(JNIEnv* env, jclass clazz) {
+    if (!ensure_lib()) {
+        return mk(env, "WAIT libil2cpp.so not loaded");
+    }
+    if (!resolve_all()) {
+        return mk(env, "ERR il2cpp symbol resolve failed");
+    }
+    Il2CppDomain* dom = g_api.domain_get();
+    if (!dom) {
+        return mk(env, "WAIT il2cpp domain not ready");
+    }
+    if (!g_api.class_get_field_from_name || !g_api.class_get_static_field_data ||
+        !g_api.field_get_offset || !g_api.object_get_class || !g_api.class_get_name) {
+        return mk(env, "ERR field/introspection api missing");
+    }
+
+    char hex[3 * 64 + 1];
+    char asc[65];
+    char out[4096];
+    out[0] = '\0';
+
+    // ---- 路径 A：静态字段 provider（HybridCLR 类可能读不到，仅先试） ----
+    Il2CppClass* sp = find_class_ns_name(dom, "Arvin.PlayerPrefsUtilities", "SimplePlayerPrefs");
+    if (sp) {
+        FieldInfo* fProv = g_api.class_get_field_from_name(sp, "provider");
+        void* sd = g_api.class_get_static_field_data(sp);
+        NLOGI("SimplePlayerPrefs staticData=%p field_provider=%p", sd, (void*)fProv);
+        if (fProv && sd) {
+            const size_t offProv = g_api.field_get_offset(fProv);
+            void* provObj = *(void**)((char*)sd + (ptrdiff_t)offProv);
+            NLOGI("provider off=%zu obj=%p", offProv, provObj);
+            if (provObj && key_from_cipher_obj(provObj, hex, sizeof(hex), asc, sizeof(asc))) {
+                snprintf(out, sizeof(out), "OK via=static provider=%p hex=%s ascii=%s",
+                         provObj, hex, asc);
+                NLOGI("%s", out);
+                return mk(env, out);
+            }
+        }
+    } else {
+        NLOGI("SimplePlayerPrefs class not found in assemblies");
+    }
+
+    // ---- 路径 B：扫 GC 堆找 RijndaelManaged 实例 ----
+    if (!g_api.gc_foreach_heap) {
+        return mk(env, "ERR no gc_foreach_heap and static path failed");
+    }
+    KeyScanCtx c;
+    memset(&c, 0, sizeof(c));
+    g_api.gc_foreach_heap(key_scan_cb, &c);
+    NLOGI("heap scanned=%d RijndaelManaged found=%d", c.seen, c.count);
+    if (c.count == 0) {
+        snprintf(out, sizeof(out),
+                 "ERR no RijndaelManaged on heap (scanned=%d) — 说明还没调用过 Encrypt/Decrypt",
+                 c.seen);
+        return mk(env, out);
+    }
+
+    int n = 0;
+    for (int i = 0; i < c.count; ++i) {
+        if (!key_from_cipher_obj(c.objs[i], hex, sizeof(hex), asc, sizeof(asc))) {
+            continue;
+        }
+        n++;
+        size_t used = strlen(out);
+        snprintf(out + used, sizeof(out) - used, "%s[%d] obj=%p hex=%s ascii=%s",
+                 used ? " | " : "", i, c.objs[i], hex, asc);
+        NLOGI("cand[%d] obj=%p hex=%s ascii=%s", i, c.objs[i], hex, asc);
+    }
+    if (n == 0) {
+        return mk(env, "ERR RijndaelManaged found but KeyValue unreadable");
+    }
+    char head[64];
+    snprintf(head, sizeof(head), "OK count=%d ", n);
+    NLOGI("dumpKey result: %s%s", head, out);
+    // 前置状态码，保持 Java 侧 ok() 判定一致
+    static char finalBuf[4096];
+    snprintf(finalBuf, sizeof(finalBuf), "%s%s", head, out);
+    return mk(env, finalBuf);
+}
