@@ -63,6 +63,9 @@ public final class NativeBridge {
 
     private static native String nativeTryTriggerLogin(boolean verbose);
 
+    /** 写 ConstConfig._gm / _openGM（纯静态字段，不调托管方法）。 */
+    private static native String nativeSetGM(boolean on);
+
     private static native String nativeProbe();
 
     /** decrypt=true 解，false 加。底层走游戏自己的 SimplePlayerPrefs。 */
@@ -700,45 +703,28 @@ public final class NativeBridge {
                 return;
             }
 
-            boolean verbose = (attempts <= 3) || (attempts % 200 == 0);
             String r;
             try {
-                r = nativeTryTriggerLogin(verbose);
+                // 只写 ConstConfig 的两个静态字段（_gm / _openGM）。
+                // 纯内存写入：不调托管方法（不碰 runtime_invoke）、不碰
+                // Unity 对象，所以不会闪退。之前所有闪退都是 runtime_invoke
+                // 引起的（Complete.Invoke / DecryptString），这条路彻底避开。
+                r = nativeSetGM(true);
             } catch (Throwable t) {
-                XposedBridge.log(TAG + ": native 调用异常 -> " + t);
+                XposedBridge.log(TAG + ": nativeSetGM 异常 -> " + t);
                 main().postDelayed(this, INTERVAL_MS);
                 return;
             }
             if (r == null) {
                 r = "(null)";
             }
-            if (!r.equals(lastStatus) || verbose) {
-                XposedBridge.log(TAG + ": [try#" + attempts + "] " + r);
+            if (!r.equals(lastStatus)) {
+                XposedBridge.log(TAG + ": [gm#" + attempts + "] " + r);
                 lastStatus = r;
-            }
-            if (attempts == 5) {
-                try {
-                    XposedBridge.log(TAG + ": " + nativeProbe());
-                } catch (Throwable t) {
-                    XposedBridge.log(TAG + ": probe 失败 -> " + t);
-                }
             }
             if (r.startsWith("OK")) {
                 triggered = true;
-                XposedBridge.log(TAG + ": ===== 免登陆触发成功：已代点“登录”，游戏将直接进入主流程 =====");
-                return;
-            }
-            // SKIP = native 侧检测到 Complete 委托已存在，但自动触发被开关关闭
-            // （实测那条链最终仍要向服务器要 token，绕不过服务端验证，
-            //  且在 runtime_invoke 栈里启动 UniTask 会把游戏打成 SIGTRAP）。
-            // 既然已经拿到确定结论，就不再轮询，避免干扰游戏主线程。
-            if (r.startsWith("SKIP")) {
-                triggered = true;
-                XposedBridge.log(TAG + ": ===== 诊断结束，自动触发已关闭：" + r);
-                // il2cpp 到这里肯定就绪了，正好把存档解密出来看看钻石存在哪
-                dumpPrefs();
-                // provider 要等游戏真正读存档才会创建，延迟轮询拿 AES key
-                startKeyDumpLoop();
+                XposedBridge.log(TAG + ": ===== GM 已开启：进游戏后找 GM 按钮 / 作弊菜单 =====");
                 return;
             }
             main().postDelayed(this, INTERVAL_MS);

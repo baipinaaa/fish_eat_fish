@@ -1317,3 +1317,89 @@ Java_com_kunpo_crack_NativeBridge_nativeDumpKey(JNIEnv* env, jclass clazz) {
     snprintf(finalBuf, sizeof(finalBuf), "%s%s", head, out);
     return mk(env, finalBuf);
 }
+
+// ---------------------------------------------------------------------------
+// 打开游戏内置 GM 面板（纯内存写，不调托管方法，不会闪退）
+//
+// 官方 1.1.8 源码（work/live/official_all.cs，ilspy 反编译 Logic_official.dll）：
+//   10830: public class ConstConfig            // 全局命名空间（引用处写作 ConstConfig.IsDev）
+//   11032: public static bool IsDev;
+//   11231: public static bool OpenGM { get { return _gm; } set { _gm = value; } }
+//   11243: public static bool CanShowGM => IsDev & OpenGM;
+//   11461: IsDev = true;   // 静态构造里官方自己就设了 true
+//   11462: _gm = false;    // 唯一拦住 GM 的就是这个
+//   66814: WindowManager.Register("Main", "GMWnd", "GameMain", typeof(GMWnd));
+//  138148: WindowManager.ShowWindow("GMWnd", null);
+//
+// 所以把静态字段 _gm 写成 true，CanShowGM 立刻为 true，GM 入口就出现。
+// 这是纯内存写（直接改 static_fields），不进入解释器，所以不会像
+// runtime_invoke 那样把游戏打崩。
+// ---------------------------------------------------------------------------
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_kunpo_crack_NativeBridge_nativeSetGM(JNIEnv* env, jclass clazz, jboolean on) {
+    if (!ensure_lib()) {
+        return mk(env, "WAIT libil2cpp.so not loaded");
+    }
+    if (!resolve_all()) {
+        return mk(env, "WAIT il2cpp api not ready");
+    }
+    Il2CppDomain* dom = g_api.domain_get();
+    if (!dom) {
+        return mk(env, "WAIT il2cpp domain not ready");
+    }
+    if (!g_api.class_get_field_from_name || !g_api.class_get_static_field_data ||
+        !g_api.field_get_offset) {
+        return mk(env, "ERR field api missing");
+    }
+
+    // ConstConfig 在全局命名空间；再兼容几种可能的写法
+    Il2CppClass* cc = find_class_ns_name(dom, "", "ConstConfig");
+    if (!cc) {
+        cc = find_class_ns_name(dom, "Kunpo", "ConstConfig");
+    }
+    if (!cc) {
+        cc = find_class_ns_name(dom, "Game", "ConstConfig");
+    }
+    if (!cc) {
+        return mk(env, "WAIT ConstConfig not found yet");
+    }
+
+    void* sd = g_api.class_get_static_field_data(cc);
+    if (!sd) {
+        return mk(env, "ERR ConstConfig static data is null");
+    }
+
+    const bool want = (on == JNI_TRUE);
+
+    // _gm 是 OpenGM 的 backing field
+    FieldInfo* fGm = g_api.class_get_field_from_name(cc, "_gm");
+    if (!fGm) {
+        return mk(env, "ERR field '_gm' not found");
+    }
+    const size_t offGm = g_api.field_get_offset(fGm);
+    unsigned char* pGm = (unsigned char*)sd + offGm;
+    const unsigned char gmBefore = *pGm;
+    *pGm = want ? 1 : 0;
+
+    // IsDev 官方已经是 true，顺手确保一下（不影响其他逻辑）
+    size_t offDev = 0;
+    int devBefore = -1;
+    int devAfter = -1;
+    FieldInfo* fDev = g_api.class_get_field_from_name(cc, "IsDev");
+    if (fDev) {
+        offDev = g_api.field_get_offset(fDev);
+        unsigned char* pDev = (unsigned char*)sd + offDev;
+        devBefore = *pDev;
+        if (want && !devBefore) {
+            *pDev = 1;
+        }
+        devAfter = *pDev;
+    }
+
+    char out[256];
+    snprintf(out, sizeof(out),
+             "OK _gm(off=%zu) %d->%d ; IsDev(off=%zu) %d->%d",
+             offGm, gmBefore, *pGm, offDev, devBefore, devAfter);
+    NLOGI("setGM: %s", out);
+    return mk(env, out);
+}
