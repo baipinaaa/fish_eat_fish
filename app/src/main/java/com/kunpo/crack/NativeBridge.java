@@ -115,6 +115,13 @@ public final class NativeBridge {
             return;
         }
         startPolling();
+        // 立刻打一次探针：把 il2cpp 里可见的 image 清单/目标类是否可见落到日志，
+        // 排障第一步就看这一行（此时 il2cpp 可能还没起来，返回 domain not ready 正常）。
+        try {
+            XposedBridge.log(TAG + ": [probe] " + nativeProbe());
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": probe 失败 -> " + t);
+        }
     }
 
     private static Context contextByReflection() {
@@ -140,40 +147,64 @@ public final class NativeBridge {
             return true;
         }
 
-        // 1) 模块自己的 nativeLibraryDir（最省事，前提是 PackageManager 能查到本模块）
+        final String abi = primaryAbi();
+
+        // 0) 先算出模块自己的 APK 路径 / so 目录。
+        //    完全不依赖 PackageManager —— HMA-OSS 之类的“隐藏应用列表”会让
+        //    getApplicationInfo(MODULE_PKG) 直接抛 NameNotFoundException:
+        //    com.kunpo.crack（已在真机日志里复现）。
+        String[] mp = modulePathsFromClassLoader();
+        String clApk = (mp != null) ? mp[0] : null;
+        String clLibDir = (mp != null) ? mp[1] : null;
+        if (clApk != null) {
+            XposedBridge.log(TAG + ": classloader 推出 apk=" + clApk + " libDir=" + clLibDir);
+        }
+
+        // 1) 直接 load 系统已解压好的 <apkDir>/lib/<abi>/libfishcrack.so。
+        //    build.gradle 里 useLegacyPackaging=true → extractNativeLibs=true，
+        //    安装时系统就会把 .so 解压到该目录，路径合法（apk_data_file）
+        //    且不受包可见性影响。
+        if (clLibDir != null && tryLoad(clLibDir + "/" + LIB_FILE, "classloader libDir")) {
+            return true;
+        }
+        if (clApk != null) {
+            File apkDir = new File(clApk).getParentFile();
+            for (String a : new String[]{abi, "arm64-v8a", "armeabi-v7a"}) {
+                File f = new File(apkDir, "lib/" + a + "/" + LIB_FILE);
+                if (tryLoad(f.getAbsolutePath(), "derived lib/" + a)) {
+                    return true;
+                }
+            }
+        }
+
+        // 2) 从模块 APK 里抠出 .so，落到宿主 codeCacheDir 再 load
+        for (String cand : new String[]{clApk, moduleApkPath()}) {
+            if (cand == null) {
+                continue;
+            }
+            try {
+                File out = new File(ctx.getCodeCacheDir(), LIB_FILE);
+                if (extractFromApk(cand, out) && tryLoad(out.getAbsolutePath(), "extracted")) {
+                    return true;
+                }
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + ": 从 APK 抽取 .so 失败 -> " + t);
+            }
+        }
+
+        // 3) PackageManager 的 nativeLibraryDir（HMA-OSS 等可能让这里抛异常）
         try {
             ApplicationInfo ai = ctx.getPackageManager().getApplicationInfo(MODULE_PKG, 0);
-            if (ai != null && ai.nativeLibraryDir != null) {
-                File f = new File(ai.nativeLibraryDir, LIB_FILE);
-                if (f.exists()) {
-                    System.load(f.getAbsolutePath());
-                    libLoaded = true;
-                    XposedBridge.log(TAG + ": loaded via nativeLibraryDir: " + f);
-                    return true;
-                }
-                XposedBridge.log(TAG + ": nativeLibraryDir 里没有 " + LIB_FILE + " -> " + f);
+            if (ai != null && ai.nativeLibraryDir != null
+                    && tryLoad(new File(ai.nativeLibraryDir, LIB_FILE).getAbsolutePath(),
+                    "nativeLibraryDir")) {
+                return true;
             }
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": getApplicationInfo 失败（Android 11+ 包可见性）-> " + t);
+            XposedBridge.log(TAG + ": getApplicationInfo 失败（Android 11+ 包可见性 / HMA）-> " + t);
         }
 
-        // 2) 顺着模块 APK 路径把 .so 抠出来，落到宿主私有目录再 load
-        try {
-            String apk = moduleApkPath();
-            if (apk != null) {
-                File out = new File(ctx.getCacheDir(), LIB_FILE);
-                if (extractFromApk(apk, out)) {
-                    System.load(out.getAbsolutePath());
-                    libLoaded = true;
-                    XposedBridge.log(TAG + ": loaded via extracted " + out + " (apk=" + apk + ")");
-                    return true;
-                }
-            }
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + ": 从 APK 抽取 .so 失败 -> " + t);
-        }
-
-        // 3) 交给系统找（某些 LSPosed 版本会把模块 lib 目录挂进宿主）
+        // 4) 交给系统找（某些 LSPosed 版本会把模块 lib 目录挂进宿主）
         try {
             System.loadLibrary("fishcrack");
             libLoaded = true;
@@ -183,6 +214,121 @@ public final class NativeBridge {
             XposedBridge.log(TAG + ": System.loadLibrary 失败 -> " + t);
         }
         return false;
+    }
+
+    /** System.load 包一层：失败不抛、只记日志，方便逐条路径试。 */
+    private static boolean tryLoad(String path, String how) {
+        if (path == null) {
+            return false;
+        }
+        File f = new File(path);
+        if (!f.exists()) {
+            XposedBridge.log(TAG + ": [" + how + "] 不存在: " + path);
+            return false;
+        }
+        try {
+            System.load(path);
+            libLoaded = true;
+            XposedBridge.log(TAG + ": loaded via " + how + ": " + path);
+            return true;
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": [" + how + "] load 失败 -> " + t);
+            return false;
+        }
+    }
+
+    /** 进程主 ABI。 */
+    private static String primaryAbi() {
+        String[] abis = Build.SUPPORTED_ABIS;
+        if (abis != null && abis.length > 0 && abis[0] != null) {
+            return abis[0];
+        }
+        return "arm64-v8a";
+    }
+
+    /**
+     * 不依赖 PackageManager 定位模块 APK 与其 so 目录。
+     *
+     * LSPosed 的 LspModuleClassLoader extends BaseDexClassLoader，其
+     * nativeLibraryDirectories 形如：
+     *   /data/app/~~Rn2Bs-...==/com.kunpo.crack-GEIh...==/base.apk!/lib/arm64-v8a
+     * 从 "!/" 处切一刀就得到 APK 路径与 APK 内的 lib 相对路径，再拼成
+     * 系统实际解压出来的目录。
+     *
+     * @return {apkPath, libDirOnDisk}，拿不到返回 null
+     */
+    private static String[] modulePathsFromClassLoader() {
+        try {
+            ClassLoader cl = NativeBridge.class.getClassLoader();
+            if (cl == null) {
+                return null;
+            }
+            Field f = Class.forName("dalvik.system.BaseDexClassLoader")
+                    .getDeclaredField("pathList");
+            f.setAccessible(true);
+            Object pathList = f.get(cl);
+            if (pathList == null) {
+                return null;
+            }
+
+            // nativeLibraryDirectories 多数版本是 File[]，也有 List<File> 实现；
+            // 都拿不到时退回解析 pathList.toString()（真机日志已证明它含该数组）。
+            List<String> paths = new ArrayList<>();
+            try {
+                Field nf = pathList.getClass().getDeclaredField("nativeLibraryDirectories");
+                nf.setAccessible(true);
+                Object v = nf.get(pathList);
+                if (v instanceof Object[]) {
+                    for (Object o : (Object[]) v) {
+                        if (o != null) {
+                            paths.add(String.valueOf(o));
+                        }
+                    }
+                } else if (v instanceof Iterable) {
+                    for (Object o : (Iterable<?>) v) {
+                        if (o != null) {
+                            paths.add(String.valueOf(o));
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+                // 走下面的 toString() 兜底
+            }
+            if (paths.isEmpty()) {
+                String s = String.valueOf(pathList);
+                String key = "nativeLibraryDirectories=[";
+                int lb = s.indexOf(key);
+                if (lb >= 0) {
+                    int rb = s.indexOf(']', lb);
+                    if (rb > lb) {
+                        String body = s.substring(lb + key.length(), rb);
+                        for (String p : body.split(",")) {
+                            String t = p.trim();
+                            if (!t.isEmpty()) {
+                                paths.add(t);
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (String p : paths) {
+                int bang = p.indexOf("!/");
+                if (bang <= 0) {
+                    continue;
+                }
+                String apk = p.substring(0, bang);
+                String inner = p.substring(bang + 2); // 例如 lib/arm64-v8a
+                File apkDir = new File(apk).getParentFile();
+                if (apkDir == null) {
+                    continue;
+                }
+                return new String[]{apk, new File(apkDir, inner).getAbsolutePath()};
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": modulePathsFromClassLoader 失败 -> " + t);
+        }
+        return null;
     }
 
     /** 从模块自身的 BaseDexClassLoader 里挖出模块 APK 路径（不依赖 PackageManager）。 */
@@ -261,6 +407,8 @@ public final class NativeBridge {
                 fos.close();
                 in.close();
                 outFile.setReadable(true, true);
+                // Android 10+ 的 dlopen 要求 .so 不可写（W^X），否则拒绝加载
+                outFile.setWritable(false, false);
                 XposedBridge.log(TAG + ": 抽取 " + abi + "/" + LIB_FILE + " -> " + outFile);
                 return true;
             }

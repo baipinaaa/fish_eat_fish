@@ -82,6 +82,9 @@ typedef const MethodInfo* (*pfn_class_get_method_from_name)(Il2CppClass*, const 
 typedef Il2CppObject* (*pfn_runtime_invoke)(const MethodInfo*, void*, void**, Il2CppObject**);
 typedef void* (*pfn_thread_attach)(const Il2CppDomain*);
 typedef void (*pfn_gc_foreach_heap)(void (*)(void*, void*), void*);
+typedef Il2CppClass* (*pfn_class_get_parent)(Il2CppClass*);
+// void il2cpp_class_for_each(void (*klassCallback)(Il2CppClass*, void*), void* userData)
+typedef void (*pfn_class_for_each)(void (*)(Il2CppClass*, void*), void*);
 
 struct Il2CppApi {
     void* handle;
@@ -101,10 +104,17 @@ struct Il2CppApi {
     pfn_runtime_invoke runtime_invoke;
     pfn_thread_attach thread_attach;
     pfn_gc_foreach_heap gc_foreach_heap;
+    pfn_class_get_parent class_get_parent;
+    pfn_class_for_each class_for_each;
 };
 
 static Il2CppApi g_api;
 static bool g_resolved = false;
+
+// 命中后的目标类缓存：GC 堆扫描很贵（20 万对象 × parent 链字符串比较），
+// 一次找到就记住，避免每 400 ms 重扫把游戏主线程拖卡。
+static Il2CppClass* g_cached_target = nullptr;
+static int g_scan_ticks = 0;
 
 // 目标类（热更 DLL 里的登录 UI 类）
 static const char* kTargetNs = "KunpoUserSystem_FGUI";
@@ -181,6 +191,10 @@ static bool resolve_all() {
         g_api.handle, "il2cpp_class_get_field_from_name");
     g_api.gc_foreach_heap =
         (pfn_gc_foreach_heap)dlsym(g_api.handle, "il2cpp_gc_foreach_heap");
+    g_api.class_get_parent =
+        (pfn_class_get_parent)dlsym(g_api.handle, "il2cpp_class_get_parent");
+    g_api.class_for_each =
+        (pfn_class_for_each)dlsym(g_api.handle, "il2cpp_class_for_each");
 
     g_resolved = true;
     NLOGI("il2cpp api resolved");
@@ -238,10 +252,81 @@ static Il2CppClass* find_class_in_images(Il2CppDomain* dom, size_t* outCount, ch
     return found;
 }
 
-// 兜底：热更 image 不在 domain_get_assemblies 里时，从 GC 堆上找
-// UserSystemWindow 的派生类实例，拿到那个类所属的 image。
+// ---------------------------------------------------------------------------
+// 找目标类
+// ---------------------------------------------------------------------------
+
+// k 是否就是目标类（namespace + name 精确匹配）。
+// 注意：HybridCLR 的解释器类拿到的 namespace 可能为空，此时只按名字算命中。
+static bool is_target_class(Il2CppClass* k) {
+    if (!k || !g_api.class_get_name) {
+        return false;
+    }
+    const char* nm = g_api.class_get_name(k);
+    if (!nm || strcmp(nm, kTargetClass) != 0) {
+        return false;
+    }
+    if (g_api.class_get_namespace) {
+        const char* ns = g_api.class_get_namespace(k);
+        if (ns && ns[0] != '\0' && strcmp(ns, kTargetNs) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// 沿 parent 链向上找目标类。
+// 关键：UserSystemWindow 是 abstract，堆上不会有它自己的实例；
+// 但它的 UI 子类一定有实例。用 il2cpp_class_get_parent 往上走，
+// 任一层的名字对上了，那一层的 klass 就是我们要的（静态字段在父类上）。
+static Il2CppClass* match_hierarchy(Il2CppClass* k) {
+    if (!g_api.class_get_parent) {
+        return is_target_class(k) ? k : nullptr;
+    }
+    for (int depth = 0; k && depth < 32; depth++) {
+        if (is_target_class(k)) {
+            return k;
+        }
+        k = g_api.class_get_parent(k);
+    }
+    return nullptr;
+}
+
+// il2cpp_class_for_each 全类遍历（HybridCLR 的解释器类通常能被它枚举到）
+struct ClassScan {
+    Il2CppClass* klass;
+    int seen;
+    int limit;
+    int kunpoSeen;
+    bool stop;
+};
+
+static void class_for_each_cb(Il2CppClass* k, void* userData) {
+    ClassScan* c = (ClassScan*)userData;
+    if (c->stop || !k) {
+        return;
+    }
+    if (++c->seen > c->limit) {
+        c->stop = true;
+        return;
+    }
+    if (g_api.class_get_namespace) {
+        const char* ns = g_api.class_get_namespace(k);
+        if (ns && strncmp(ns, "Kunpo", 5) == 0) {
+            c->kunpoSeen++;
+        }
+    }
+    Il2CppClass* hit = match_hierarchy(k);
+    if (hit) {
+        c->klass = hit;
+        c->stop = true;
+    }
+}
+
+// 兜底：从 GC 堆的实例反推（热更 image 既不在 assemblies 列表里、
+// 也不被 for_each 枚举时，只能顺着实例 -> klass -> parent 链找）
 struct HeapScan {
-    Il2CppClass* klass;    // 直接命中 UserSystemWindow（理论上有静态引用时可能出现）
+    Il2CppClass* klass;
     Il2CppImage* image;    // 任取一个热更 image
     int seen;
     int limit;
@@ -261,9 +346,9 @@ static void heap_scan_cb(void* data, void* userData) {
     if (!k) {
         return;
     }
-    const char* nm = g_api.class_get_name ? g_api.class_get_name(k) : nullptr;
-    if (nm && strcmp(nm, kTargetClass) == 0) {
-        ctx->klass = k;
+    Il2CppClass* hit = match_hierarchy(k);
+    if (hit) {
+        ctx->klass = hit;
         ctx->stop = true;
         return;
     }
@@ -356,38 +441,60 @@ Java_com_kunpo_crack_NativeBridge_nativeTryTriggerLogin(JNIEnv* env, jclass claz
     size_t imageCount = 0;
     char diag[768];
     diag[0] = '\0';
-    Il2CppClass* target = find_class_in_images(dom, &imageCount, diag, sizeof(diag));
 
-    // 兜底：从 GC 堆上找（HybridCLR 的热更 image 未必出现在 assemblies 列表里）
-    if (!target && g_api.gc_foreach_heap && g_api.class_get_image) {
+    // L1：标准路径（AOT image 里按名字查）。命中过就直接用缓存。
+    Il2CppClass* target = g_cached_target;
+    if (!target) {
+        target = find_class_in_images(dom, &imageCount, diag, sizeof(diag));
+    }
+
+    // L2：il2cpp_class_for_each 全类遍历。HybridCLR 的解释器类不在 AOT
+    //     metadata 里，但通常能被这个 API 枚举到 —— 这是主要修复点。
+    int forEachSeen = 0;
+    if (!target && g_api.class_for_each) {
+        ClassScan cs;
+        memset(&cs, 0, sizeof(cs));
+        cs.limit = 200000;
+        g_api.class_for_each(class_for_each_cb, &cs);
+        forEachSeen = cs.seen;
+        if (cs.klass) {
+            target = cs.klass;
+        }
+    }
+
+    // L3：GC 堆实例反推（贵，降频到每 3 次轮询一次）
+    int heapSeen = -1;
+    bool wantHeap = ((g_scan_ticks++ % 3) == 0);
+    if (!target && wantHeap && g_api.gc_foreach_heap
+            && (g_api.class_get_image || g_api.class_get_parent)) {
         HeapScan ctx;
-        ctx.klass = nullptr;
-        ctx.image = nullptr;
-        ctx.seen = 0;
+        memset(&ctx, 0, sizeof(ctx));
         ctx.limit = 200000;
-        ctx.stop = false;
         g_api.gc_foreach_heap(heap_scan_cb, &ctx);
+        heapSeen = ctx.seen;
         if (ctx.klass) {
             target = ctx.klass;
         } else if (ctx.image) {
+            // L4：拿到热更 image 后再按名字查
             target = g_api.class_from_name(ctx.image, kTargetNs, kTargetClass);
             if (target) {
                 NLOGI("found %s via GC heap scan (image=%s)", kTargetClass,
                       g_api.image_get_name ? g_api.image_get_name(ctx.image) : "?");
             }
         }
-        if (!target && verbose) {
-            snprintf(out, sizeof(out),
-                     "WAIT class not found; assemblies=%zu, heap scanned=%d",
-                     imageCount, ctx.seen);
-            return mk(env, out);
-        }
+    }
+
+    if (target && !g_cached_target) {
+        g_cached_target = target;
+        NLOGI("target class %s.%s cached (klass=%p)", kTargetNs, kTargetClass,
+              (void*)target);
     }
 
     if (!target) {
         if (verbose) {
-            snprintf(out, sizeof(out), "WAIT class not found; assemblies=%zu images=%s",
-                     imageCount, diag);
+            snprintf(out, sizeof(out),
+                     "WAIT class not found; assemblies=%zu for_each=%d heap=%d images=%s",
+                     imageCount, forEachSeen, heapSeen, diag);
         } else {
             snprintf(out, sizeof(out), "WAIT class not found (assemblies=%zu)", imageCount);
         }
@@ -459,7 +566,39 @@ Java_com_kunpo_crack_NativeBridge_nativeProbe(JNIEnv* env, jclass clazz) {
     char diag[3000];
     diag[0] = '\0';
     Il2CppClass* target = find_class_in_images(dom, &imageCount, diag, sizeof(diag));
-    snprintf(out, sizeof(out), "probe: assemblies=%zu target=%s images=%s",
-             imageCount, target ? "FOUND" : "missing", diag);
+
+    int forEachSeen = 0;
+    int kunpoClasses = 0;
+    if (!target && g_api.class_for_each) {
+        ClassScan cs;
+        memset(&cs, 0, sizeof(cs));
+        cs.limit = 500000;
+        g_api.class_for_each(class_for_each_cb, &cs);
+        forEachSeen = cs.seen;
+        kunpoClasses = cs.kunpoSeen;
+        if (cs.klass) {
+            target = cs.klass;
+        }
+    }
+
+    int heapSeen = -1;
+    if (!target && g_api.gc_foreach_heap
+            && (g_api.class_get_image || g_api.class_get_parent)) {
+        HeapScan ctx;
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.limit = 500000;
+        g_api.gc_foreach_heap(heap_scan_cb, &ctx);
+        heapSeen = ctx.seen;
+        if (ctx.klass) {
+            target = ctx.klass;
+        } else if (ctx.image) {
+            target = g_api.class_from_name(ctx.image, kTargetNs, kTargetClass);
+        }
+    }
+
+    snprintf(out, sizeof(out),
+             "probe: assemblies=%zu for_each=%d kunpo=%d heap=%d target=%s images=%s",
+             imageCount, forEachSeen, kunpoClasses, heapSeen,
+             target ? "FOUND" : "missing", diag);
     return mk(env, out);
 }
