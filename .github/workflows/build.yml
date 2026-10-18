@@ -20,13 +20,38 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Accept licenses + install SDK platform / build-tools
+      # 注意：这里**不能**用 android-actions/setup-android@v3。
+      # 该 action 内部硬编码执行 `sdkmanager tools`，而 `tools` 包在新版 Android
+      # SDK 仓库中已被 cmdline-tools 取代，于是它必定以
+      #   Warning: Failed to find package 'tools'
+      #   Error: ... failed with exit code 1
+      # 让 job 直接死在 “Set up Android SDK” 这一步。
+      # GitHub 的 ubuntu-latest 运行器本身就预装了 Android SDK（$ANDROID_HOME），
+      # 直接用它的 sdkmanager 装我们需要的包即可。
+      - name: Accept Android SDK licenses + install platform / build-tools
         run: |
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          set -eux
+          echo "ANDROID_HOME=${ANDROID_HOME:-unset}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-unset}"
+
+          # runner 的 sdkmanager 未必在 PATH 里（镜像常只把它放在
+          # cmdline-tools/<版本号>/bin/ 下，且版本号不固定，不一定是 latest）。
+          SDKMANAGER="$(command -v sdkmanager || true)"
+          if [ -z "$SDKMANAGER" ]; then
+            for root in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" /usr/local/lib/android/sdk /usr/lib/android-sdk; do
+              [ -n "$root" ] || continue
+              cand="$(ls -d "$root"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -1 || true)"
+              if [ -n "$cand" ]; then SDKMANAGER="$cand"; break; fi
+            done
+          fi
+          if [ -z "$SDKMANAGER" ]; then echo "ERROR: sdkmanager not found"; exit 1; fi
+          echo "using sdkmanager: $SDKMANAGER"
+
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" --install "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+          ls "$ANDROID_HOME/platforms"
+          ls "$ANDROID_HOME/build-tools"
 
       - name: Set up Gradle 8.5
         uses: gradle/actions/setup-gradle@v4
