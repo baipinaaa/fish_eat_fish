@@ -163,19 +163,21 @@ static bool find_so_in_maps(const char* needle, SoImage* out) {
         if (path[0] != '/') {
             continue;
         }
-        if (off == 0) {
-            // 文件头所在段：这里的 start 就是加载基址
-            out->base = (void*)start;
-            strncpy(out->path, path, sizeof(out->path) - 1);
-            got = true;
-            break;
+        // 只认可执行段。
+        // Unity 启动早期会先把 libil2cpp.so 映射成 r--p，稍后才 mprotect 成
+        // r-xp。如果在这个窗口里就去调函数，取指会直接 SIGSEGV
+        // (SEGV_ACCERR) 把游戏打崩（真机已复现：pc == fault addr，栈顶就在
+        // il2cpp_domain_get 入口）。拿不到可执行段就当作“还没就绪”，
+        // 交回上层 400ms 轮询继续等。
+        if (perms[2] != 'x') {
+            continue;
         }
-        if (!got) {
-            // maps 的 offset 列已经是字节偏移，不用乘页大小
-            out->base = (void*)(start - off);
-            strncpy(out->path, path, sizeof(out->path) - 1);
-            got = true;
-        }
+        // 由可执行段反推加载基址。ELF 要求 p_vaddr % p_align == p_offset % p_align，
+        // ARM64 上 libil2cpp.so 的 vaddr 与 offset 相同，start - off 就是基址。
+        out->base = (void*)(start - off);
+        strncpy(out->path, path, sizeof(out->path) - 1);
+        got = true;
+        break;
     }
     fclose(fp);
     return got;
@@ -240,6 +242,34 @@ static void* elf_lookup(const SoImage* img, const char* name) {
         }
     }
     return nullptr;
+}
+
+// 校验某个地址当前是否落在一个可执行映射里。
+// 用于在真正调用 JIT/AOT 函数前确认代码段已经 mprotect 成可执行。
+static bool is_executable_addr(const void* addr) {
+    if (!addr) {
+        return false;
+    }
+    FILE* fp = fopen("/proc/self/maps", "r");
+    if (!fp) {
+        return false;
+    }
+    const unsigned long target = (unsigned long)(uintptr_t)addr;
+    bool ok = false;
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+        unsigned long s = 0, e = 0;
+        char perms[8] = {0};
+        if (sscanf(line, "%lx-%lx %7s", &s, &e, perms) != 3) {
+            continue;
+        }
+        if (target >= s && target < e) {
+            ok = (perms[2] == 'x');
+            break;
+        }
+    }
+    fclose(fp);
+    return ok;
 }
 
 static bool ensure_lib() {
@@ -337,6 +367,15 @@ static bool resolve_all() {
         (pfn_class_get_parent)dlsym(g_api.handle, "il2cpp_class_get_parent");
     g_api.class_for_each =
         (pfn_class_for_each)dlsym(g_api.handle, "il2cpp_class_for_each");
+
+    // 最后一道保险：确认关键函数所在页确实可执行。
+    // 地址算对但页还是 r--p 时直接调用 = SIGSEGV，游戏当场闪退。
+    void* dg = nullptr;
+    memcpy(&dg, &g_api.domain_get, sizeof(void*));
+    if (!is_executable_addr(dg)) {
+        NLOGI("il2cpp 代码段尚未就绪（domain_get 不可执行），等下一次轮询");
+        return false;
+    }
 
     g_resolved = true;
     NLOGI("il2cpp api resolved");
