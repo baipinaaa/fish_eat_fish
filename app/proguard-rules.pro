@@ -1,0 +1,3 @@
+-dontwarn de.robv.android.xposed.**
+-keep class com.kunpo.crack.** { *; }
+-keep class de.robv.android.xposed.** { *; }

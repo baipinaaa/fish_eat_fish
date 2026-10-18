@@ -1,0 +1,53 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.kunpo.crack'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.kunpo.crack"
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled false
+        }
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+
+    packaging {
+        resources {
+            excludes += ['META-INF/*.kotlin_module']
+        }
+    }
+}
+
+dependencies {
+    // Xposed API 82。优先用随仓库内置的 jar（app/libs/xposed-api-82.jar，Apache-2.0），
+    // 这样 CI 不依赖 api.xposed.info（已不可直连）；jar 不存在时才回退到 maven 镜像。
+    def localApi = file('libs/xposed-api-82.jar')
+    if (localApi.exists()) {
+        compileOnly files(localApi)
+    } else {
+        compileOnly 'de.robv.android.xposed:api:82'
+    }
+}
