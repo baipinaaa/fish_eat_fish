@@ -48,6 +48,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>   // malloc / free（nativePrefsCall 里给返回串分配缓冲）
 #include <elf.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -83,6 +84,11 @@ typedef FieldInfo* (*pfn_class_get_field_from_name)(Il2CppClass*, const char*);
 typedef size_t (*pfn_field_get_offset)(FieldInfo*);
 typedef void* (*pfn_class_get_static_field_data)(Il2CppClass*);
 typedef Il2CppClass* (*pfn_object_get_class)(Il2CppObject*);
+// il2cpp 字符串 API：让模块能直接调游戏自己的加解密函数
+// （存档的 AES key 已换，旧 key 解不开，只能借用游戏自身的 DecryptString）
+typedef Il2CppObject* (*pfn_string_new)(const char*);
+typedef uint16_t* (*pfn_string_chars)(Il2CppObject*);
+typedef int32_t (*pfn_string_length)(Il2CppObject*);
 typedef const MethodInfo* (*pfn_class_get_method_from_name)(Il2CppClass*, const char*, int);
 typedef Il2CppObject* (*pfn_runtime_invoke)(const MethodInfo*, void*, void**, Il2CppObject**);
 typedef void* (*pfn_thread_attach)(const Il2CppDomain*);
@@ -109,6 +115,9 @@ struct Il2CppApi {
     pfn_field_get_offset field_get_offset;
     pfn_class_get_static_field_data class_get_static_field_data;
     pfn_object_get_class object_get_class;
+    pfn_string_new string_new;
+    pfn_string_chars string_chars;
+    pfn_string_length string_length;
     pfn_class_get_method_from_name class_get_method_from_name;
     pfn_runtime_invoke runtime_invoke;
     pfn_thread_attach thread_attach;
@@ -388,6 +397,10 @@ static bool resolve_all() {
     g_api.class_for_each = (pfn_class_for_each)resolve_opt("il2cpp_class_for_each");
     g_api.class_get_fields = (pfn_class_get_fields)resolve_opt("il2cpp_class_get_fields");
     g_api.field_get_name = (pfn_field_get_name)resolve_opt("il2cpp_field_get_name");
+    // 字符串 API：DecryptString / EncryptString 需要它们构造入参、读返回值
+    g_api.string_new = (pfn_string_new)resolve_opt("il2cpp_string_new");
+    g_api.string_chars = (pfn_string_chars)resolve_opt("il2cpp_string_chars");
+    g_api.string_length = (pfn_string_length)resolve_opt("il2cpp_string_length");
     NLOGI("optional symbols: image=%p name=%p fields=%p field_name=%p field_by_name=%p",
           (void*)g_api.class_get_image, (void*)g_api.class_get_name,
           (void*)g_api.class_get_fields, (void*)g_api.field_get_name,
@@ -414,6 +427,153 @@ static bool resolve_all() {
 // ---------------------------------------------------------------------------
 static jstring mk(JNIEnv* env, const char* s) {
     return env->NewStringUTF(s ? s : "(null)");
+}
+
+// ---------------------------------------------------------------------------
+// 调用游戏自身的 SimplePlayerPrefs.EncryptString / DecryptString
+//
+// 为什么要绕这一圈：1.1.8 的存档 AES 密钥已经不是旧的那把
+// (:{j%6j?E:t#}G10mM%9hp5S=%}2,Y26C)，用旧 key 硬解只会得到乱码。最稳的办法
+// 是直接让游戏的托管代码替我们加解密 —— 它手里一定是最新的 key。
+// ---------------------------------------------------------------------------
+static const char* kPrefsNs = "Arvin.PlayerPrefsUtilities";
+static const char* kPrefsClass = "SimplePlayerPrefs";
+
+// Il2CppString 布局（64 位）：klass(8) + monitor(8) + length(4) + chars[]
+// 导出符号缺失时按内存布局兜底读取。
+static int32_t str_len(Il2CppObject* s) {
+    if (g_api.string_length) return g_api.string_length(s);
+    return *(int32_t*)((char*)s + 16);
+}
+static const uint16_t* str_chars(Il2CppObject* s) {
+    if (g_api.string_chars) return g_api.string_chars(s);
+    return (const uint16_t*)((char*)s + 20);
+}
+
+// UTF-16LE -> UTF-8（含代理对）
+static void utf16_to_utf8(const uint16_t* s, int32_t len, char* out, size_t outSize) {
+    size_t o = 0;
+    for (int32_t i = 0; i < len && o + 5 < outSize; ++i) {
+        uint32_t c = s[i];
+        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < len) {
+            const uint32_t lo = s[i + 1];
+            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                c = 0x10000 + ((c - 0xD800) << 10) + (lo - 0xDC00);
+                ++i;
+            }
+        }
+        if (c < 0x80) {
+            out[o++] = (char)c;
+        } else if (c < 0x800) {
+            out[o++] = (char)(0xC0 | (c >> 6));
+            out[o++] = (char)(0x80 | (c & 0x3F));
+        } else if (c < 0x10000) {
+            out[o++] = (char)(0xE0 | (c >> 12));
+            out[o++] = (char)(0x80 | ((c >> 6) & 0x3F));
+            out[o++] = (char)(0x80 | (c & 0x3F));
+        } else {
+            out[o++] = (char)(0xF0 | (c >> 18));
+            out[o++] = (char)(0x80 | ((c >> 12) & 0x3F));
+            out[o++] = (char)(0x80 | ((c >> 6) & 0x3F));
+            out[o++] = (char)(0x80 | (c & 0x3F));
+        }
+    }
+    out[o] = '\0';
+}
+
+// 按命名空间 + 类名遍历所有 image 找类（不限于 UserSystemWindow）
+static Il2CppClass* find_class_ns_name(Il2CppDomain* dom, const char* ns, const char* name) {
+    if (!dom || !g_api.assembly_get_image || !g_api.class_from_name) return nullptr;
+    for (int i = 0;; ++i) {
+        Il2CppImage* img = g_api.assembly_get_image(dom, i);
+        if (!img) break;
+        Il2CppClass* k = g_api.class_from_name(img, ns, name);
+        if (k) {
+            NLOGI("found %s.%s in image %s", ns, name,
+                  g_api.image_get_name ? g_api.image_get_name(img) : "?");
+            return k;
+        }
+    }
+    return nullptr;
+}
+
+/**
+ * decrypt=true  -> DecryptString(arg)  返回明文
+ * decrypt=false -> EncryptString(arg)  返回密文
+ * 成功返回托管字符串对象，失败返回 nullptr 并写 err。
+ */
+static Il2CppObject* prefs_call(bool decrypt, const char* argUtf8, char* err, size_t errSize) {
+    if (err && errSize) err[0] = '\0';
+    if (!g_api.string_new || !g_api.class_from_name || !g_api.class_get_method_from_name ||
+        !g_api.runtime_invoke || !g_api.domain_get) {
+        snprintf(err, errSize, "核心符号缺失（string_new=%p）", (void*)g_api.string_new);
+        return nullptr;
+    }
+    Il2CppDomain* dom = g_api.domain_get();
+    if (!dom) {
+        snprintf(err, errSize, "il2cpp domain 未就绪");
+        return nullptr;
+    }
+    g_api.thread_attach(dom);
+
+    Il2CppClass* klass = find_class_ns_name(dom, kPrefsNs, kPrefsClass);
+    if (!klass) {
+        snprintf(err, errSize, "找不到类 %s.%s", kPrefsNs, kPrefsClass);
+        return nullptr;
+    }
+    const char* mname = decrypt ? "DecryptString" : "EncryptString";
+    const MethodInfo* m = g_api.class_get_method_from_name(klass, mname, 1);
+    if (!m) {
+        snprintf(err, errSize, "找不到方法 %s(string)", mname);
+        return nullptr;
+    }
+
+    Il2CppObject* arg = g_api.string_new(argUtf8);
+    if (!arg) {
+        snprintf(err, errSize, "构造入参字符串失败");
+        return nullptr;
+    }
+
+    void* params[1] = {&arg};
+    Il2CppObject* exc = nullptr;
+    Il2CppObject* ret = g_api.runtime_invoke(m, nullptr, params, &exc);
+    if (exc) {
+        snprintf(err, errSize, "%s 抛了托管异常", mname);
+        return nullptr;
+    }
+    return ret;
+}
+
+/** 调试/改造用入口：把密文解密成明文，或把明文加密成密文。 */
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_kunpo_crack_NativeBridge_nativePrefsCall(JNIEnv* env, jclass clazz, jboolean decrypt,
+                                                 jstring arg) {
+    if (!ensure_lib()) return mk(env, "ERR libil2cpp.so 未加载");
+    if (!resolve_all()) return mk(env, "ERR il2cpp 符号解析失败");
+    if (!arg) return mk(env, "ERR 入参为空");
+
+    const char* in = env->GetStringUTFChars(arg, nullptr);
+    if (!in) return mk(env, "ERR 读取入参失败");
+
+    char why[256];
+    Il2CppObject* ret = prefs_call(decrypt != 0, in, why, sizeof(why));
+    env->ReleaseStringUTFChars(arg, in);
+
+    if (!ret) {
+        char buf[512];
+        snprintf(buf, sizeof(buf), "ERR %s", why);
+        NLOGE("nativePrefsCall failed: %s", why);
+        return mk(env, buf);
+    }
+
+    const int32_t n = str_len(ret);
+    const size_t cap = (size_t)n * 4 + 8;
+    char* out = (char*)malloc(cap);
+    if (!out) return mk(env, "ERR 内存不足");
+    utf16_to_utf8(str_chars(ret), n, out, cap);
+    jstring js = env->NewStringUTF(out);
+    free(out);
+    return js;
 }
 
 // 遍历所有 image 找类；顺带把 image 名列进 diag（最多留 700 字符）

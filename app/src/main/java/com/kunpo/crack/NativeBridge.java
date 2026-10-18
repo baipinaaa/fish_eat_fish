@@ -65,6 +65,97 @@ public final class NativeBridge {
 
     private static native String nativeProbe();
 
+    /** decrypt=true 解，false 加。底层走游戏自己的 SimplePlayerPrefs。 */
+    private static native String nativePrefsCall(boolean decrypt, String arg);
+
+    // ------------------------------------------------------------------
+    // 存档加解密（借用游戏自身的 SimplePlayerPrefs）
+    // ------------------------------------------------------------------
+
+    /**
+     * 用游戏自己的 SimplePlayerPrefs.DecryptString 解密一个存档串。
+     * 返回以 "ERR" 开头表示失败。
+     */
+    public static String decryptPrefs(String cipher) {
+        return prefsCall(true, cipher);
+    }
+
+    /** 用游戏自己的 SimplePlayerPrefs.EncryptString 加密明文（改存档时用）。 */
+    public static String encryptPrefs(String plain) {
+        return prefsCall(false, plain);
+    }
+
+    private static String prefsCall(boolean decrypt, String arg) {
+        if (arg == null) {
+            return "ERR arg is null";
+        }
+        if (!libLoaded) {
+            return "ERR native 库尚未加载（等 Application#attach）";
+        }
+        try {
+            String r = nativePrefsCall(decrypt, arg);
+            return r != null ? r : "ERR native 返回 null";
+        } catch (Throwable t) {
+            return "ERR " + t;
+        }
+    }
+
+    private static boolean ok(String s) {
+        return s != null && !s.startsWith("ERR");
+    }
+
+    /**
+     * 把游戏存档里所有项解密后打到 logcat。
+     *
+     * 直接读 shared_prefs 下的 XML 文件，而不是走 SharedPreferences API ——
+     * 因为 ArchiveTamper 已经 hook 了 SharedPreferencesImpl，走 API 拿到的是
+     * 被篡改后的值，看不到游戏真正存了什么。
+     */
+    public static void dumpPrefs() {
+        Context ctx = appContext;
+        if (ctx == null) {
+            XposedBridge.log(TAG + ": dumpPrefs: Context 还没拿到");
+            return;
+        }
+        try {
+            java.io.File f = new java.io.File(ctx.getApplicationInfo().dataDir,
+                    "shared_prefs/com.kunpo.bigfish.v2.playerprefs.xml");
+            if (!f.exists()) {
+                XposedBridge.log(TAG + ": dumpPrefs: 存档文件不存在 " + f);
+                return;
+            }
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            java.io.FileInputStream in = new java.io.FileInputStream(f);
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                bos.write(buf, 0, n);
+            }
+            in.close();
+            String xml = bos.toString("UTF-8");
+
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("<string name=\"([^\"]+)\">(.*?)</string>", java.util.regex.Pattern.DOTALL)
+                    .matcher(xml);
+            int count = 0;
+            StringBuilder sb = new StringBuilder();
+            while (m.find()) {
+                count++;
+                String rawKey = m.group(1);
+                String rawVal = m.group(2);
+                String dk = decryptPrefs(rawKey);
+                String dv = decryptPrefs(rawVal);
+                String k = ok(dk) ? dk : rawKey;
+                String v = ok(dv) ? dv : rawVal;
+                sb.append("\n  ").append(k).append(" = ")
+                        .append(v.length() > 600 ? v.substring(0, 600) + "...[共" + v.length() + "字]" : v);
+            }
+            XposedBridge.log(TAG + ": ===== 存档解密（共 " + count + " 项）=====" + sb);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": dumpPrefs 失败 -> " + t);
+        }
+    }
+
     // ------------------------------------------------------------------
     // 入口
     // ------------------------------------------------------------------
@@ -566,6 +657,8 @@ public final class NativeBridge {
             if (r.startsWith("SKIP")) {
                 triggered = true;
                 XposedBridge.log(TAG + ": ===== 诊断结束，自动触发已关闭：" + r);
+                // il2cpp 到这里肯定就绪了，正好把存档解密出来看看钻石存在哪
+                dumpPrefs();
                 return;
             }
             main().postDelayed(this, INTERVAL_MS);
