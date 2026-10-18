@@ -186,7 +186,7 @@ public final class NativeBridge {
                 continue;
             }
             try {
-                File out = new File(ctx.getCodeCacheDir(), LIB_FILE);
+                File out = prepareSoFile(ctx);
                 if (extractFromApk(cand, out) && tryLoad(out.getAbsolutePath(), "extracted")) {
                     return true;
                 }
@@ -419,6 +419,29 @@ public final class NativeBridge {
             XposedBridge.log(TAG + ": moduleApkPath 失败 -> " + t);
         }
         return null;
+    }
+
+    /**
+     * 准备抽取目标文件。
+     *
+     * 坑（真机日志坐实）：{@link #extractFromApk} 结束时会把文件设成
+     * {@code setWritable(false,false)}（Android 10+ 的 dlopen 要求 .so 不可写，
+     * 否则 W^X 拒绝加载）。于是下一次启动再用 FileOutputStream 覆盖它就会
+     * {@code EACCES (Permission denied)} —— 而 APK 里的 so 并未解压到 lib/ 目录，
+     * 抽取是唯一路径，一撞就整条链全断。
+     * 所以先恢复可写并删除；删不掉（例如旧文件还被映射着）就换个唯一名字。
+     */
+    private static File prepareSoFile(Context ctx) {
+        File dir = ctx.getCodeCacheDir();
+        File f = new File(dir, LIB_FILE);
+        if (f.exists()) {
+            //noinspection ResultOfMethodCallIgnored
+            f.setWritable(true, true);
+            if (!f.delete()) {
+                f = new File(dir, LIB_FILE + "." + System.nanoTime());
+            }
+        }
+        return f;
     }
 
     private static boolean extractFromApk(String apkPath, File outFile) {
