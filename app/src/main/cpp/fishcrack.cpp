@@ -112,6 +112,11 @@ static const char* kTargetClass = "UserSystemWindow";
 static const char* kCompleteGetter = "get_Complete";
 static const char* kCompleteField = "<Complete>k__BackingField";
 
+// UserSystemWindow.cs:460  protected static void CompleteInvoke() {
+//                              Complete?.Invoke(); Complete = null; }
+// 游戏自己用来宣告“登录成功”的入口，语义完整（含置空），优先用它。
+static const char* kCompleteInvoke = "CompleteInvoke";
+
 // ---------------------------------------------------------------------------
 // 绑定
 // ---------------------------------------------------------------------------
@@ -395,6 +400,25 @@ Java_com_kunpo_crack_NativeBridge_nativeTryTriggerLogin(JNIEnv* env, jclass claz
     if (!del) {
         snprintf(out, sizeof(out), "WAIT Complete delegate is null (%s)", why);
         return mk(env, out);
+    }
+
+    // 首选：调游戏自己的 CompleteInvoke()（protected static void, 0 参数）。
+    //   il2cpp_runtime_invoke 不做访问检查，protected 可直接调。
+    //   它做的是 Complete?.Invoke() + Complete=null，比我们手动 Invoke 更贴合
+    //   原生语义（空字段后不会因游戏后续再调 CompleteInvoke 而重复触发）。
+    //   注意：必须先确认 del != null 才调，否则 CompleteInvoke 只是空操作，
+    //   会让我们误判为“已触发”。
+    const MethodInfo* ci = g_api.class_get_method_from_name(target, kCompleteInvoke, 0);
+    if (ci) {
+        Il2CppObject* exc0 = nullptr;
+        g_api.runtime_invoke(ci, nullptr, nullptr, &exc0);
+        if (!exc0) {
+            NLOGI("Login() triggered through UserSystemWindow.CompleteInvoke()");
+            return mk(env, "OK Login() invoked via UserSystemWindow.CompleteInvoke()");
+        }
+        NLOGE("CompleteInvoke() threw a managed exception; falling back to delegate Invoke");
+    } else {
+        NLOGI("CompleteInvoke not found; falling back to delegate Invoke");
     }
 
     Il2CppClass* delClass = g_api.object_get_class(del);
