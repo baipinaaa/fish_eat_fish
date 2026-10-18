@@ -481,12 +481,19 @@ static void utf16_to_utf8(const uint16_t* s, int32_t len, char* out, size_t outS
     out[o] = '\0';
 }
 
-// 按命名空间 + 类名遍历所有 image 找类（不限于 UserSystemWindow）
+// 按命名空间 + 类名遍历所有 assembly 的 image 找类（不限于 UserSystemWindow）
 static Il2CppClass* find_class_ns_name(Il2CppDomain* dom, const char* ns, const char* name) {
-    if (!dom || !g_api.assembly_get_image || !g_api.class_from_name) return nullptr;
-    for (int i = 0;; ++i) {
-        Il2CppImage* img = g_api.assembly_get_image(dom, i);
-        if (!img) break;
+    if (!dom || !g_api.domain_get_assemblies || !g_api.assembly_get_image ||
+        !g_api.class_from_name) {
+        return nullptr;
+    }
+    size_t n = 0;
+    const Il2CppAssembly** asms = g_api.domain_get_assemblies(dom, &n);
+    if (!asms) return nullptr;
+    for (size_t i = 0; i < n; ++i) {
+        // il2cpp_assembly_get_image 接受的是 Il2CppAssembly*（不是 domain+index）
+        Il2CppImage* img = g_api.assembly_get_image(asms[i]);
+        if (!img) continue;
         Il2CppClass* k = g_api.class_from_name(img, ns, name);
         if (k) {
             NLOGI("found %s.%s in image %s", ns, name,
