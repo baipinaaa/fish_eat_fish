@@ -68,6 +68,22 @@ public final class NativeBridge {
     /** decrypt=true 解，false 加。底层走游戏自己的 SimplePlayerPrefs。 */
     private static native String nativePrefsCall(boolean decrypt, String arg);
 
+    /** 读 SimplePlayerPrefs 当前的 AES 密钥（静态字段 key）。 */
+    private static native String nativePrefsKey();
+
+    /** 取当前存档 AES 密钥。返回以 "ERR" 开头表示失败。 */
+    public static String prefsKey() {
+        if (!libLoaded) {
+            return "ERR native 库尚未加载";
+        }
+        try {
+            String r = nativePrefsKey();
+            return r != null ? r : "ERR native 返回 null";
+        } catch (Throwable t) {
+            return "ERR " + t;
+        }
+    }
+
     // ------------------------------------------------------------------
     // 存档加解密（借用游戏自身的 SimplePlayerPrefs）
     // ------------------------------------------------------------------
@@ -117,6 +133,10 @@ public final class NativeBridge {
             XposedBridge.log(TAG + ": dumpPrefs: Context 还没拿到");
             return;
         }
+        // 先把 key 打出来 —— 有了它就能在 PC 上离线解密/加密存档，
+        // 不必每改一次都走一遍 native。
+        String keyStr = prefsKey();
+        XposedBridge.log(TAG + ": ===== SimplePlayerPrefs.key = [" + keyStr + "] =====");
         try {
             java.io.File f = new java.io.File(ctx.getApplicationInfo().dataDir,
                     "shared_prefs/com.kunpo.bigfish.v2.playerprefs.xml");
@@ -138,15 +158,24 @@ public final class NativeBridge {
                     .compile("<string name=\"([^\"]+)\">(.*?)</string>", java.util.regex.Pattern.DOTALL)
                     .matcher(xml);
             int count = 0;
+            // ⚠️ 默认不解密。decryptPrefs 走 il2cpp runtime_invoke，真机上会
+            // SIGSEGV（栈：nativePrefsCall → il2cpp_runtime_invoke → 解释器，
+            //  fault addr 落在栈地址）。先只把 key + 原始密文拿出来，
+            // 离线在 PC 上用同一个 AES 参数解，效果等价且不会闪退。
+            final boolean useGameDecrypt = false;
             StringBuilder sb = new StringBuilder();
             while (m.find()) {
                 count++;
                 String rawKey = m.group(1);
                 String rawVal = m.group(2);
-                String dk = decryptPrefs(rawKey);
-                String dv = decryptPrefs(rawVal);
-                String k = ok(dk) ? dk : rawKey;
-                String v = ok(dv) ? dv : rawVal;
+                String k = rawKey;
+                String v = rawVal;
+                if (useGameDecrypt) {
+                    String dk = decryptPrefs(rawKey);
+                    String dv = decryptPrefs(rawVal);
+                    if (ok(dk)) k = dk;
+                    if (ok(dv)) v = dv;
+                }
                 sb.append("\n  ").append(k).append(" = ")
                         .append(v.length() > 600 ? v.substring(0, 600) + "...[共" + v.length() + "字]" : v);
             }

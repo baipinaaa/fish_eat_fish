@@ -1041,3 +1041,90 @@ Java_com_kunpo_crack_NativeBridge_nativeProbe(JNIEnv* env, jclass clazz) {
              target ? "FOUND" : "missing", diag);
     return mk(env, out);
 }
+
+// ---------------------------------------------------------------------------
+// 读 SimplePlayerPrefs.key 静态字段（存档 AES 密钥）
+// ---------------------------------------------------------------------------
+// 为什么要这么干：
+//   SimplePlayerPrefs 的 key 默认是硬编码的 ":{j%6j?E:t#}G10mM%9hp5S=%}2,Y26C"，
+//   但它有 `public static string Msg { set { key = value; } }`，而
+//   NetHelper.SetNetConfigByLogin() 最后几行就是
+//   `SimplePlayerPrefs.Msg = NetworkConfig.UId;`
+//   —— 登录后 key 可能被改成 UId。到底当前用的是哪个，取决于 provider 的创建时机。
+//
+//   读静态字段只是内存读取，不进入解释器，不会像 runtime_invoke 那样把游戏打崩。
+
+/** 读一个静态引用类型字段的当前值。 */
+static Il2CppObject* read_static_field_obj(Il2CppClass* k, const char* name,
+                                           char* why, size_t whySize) {
+    if (!g_api.class_get_field_from_name || !g_api.class_get_static_field_data ||
+        !g_api.field_get_offset) {
+        if (why && whySize) snprintf(why, whySize, "api missing");
+        return nullptr;
+    }
+    FieldInfo* f = g_api.class_get_field_from_name(k, name);
+    if (!f) {
+        if (why && whySize) snprintf(why, whySize, "field '%s' not found", name);
+        return nullptr;
+    }
+    void* sd = g_api.class_get_static_field_data(k);
+    if (!sd) {
+        if (why && whySize) snprintf(why, whySize, "static data null");
+        return nullptr;
+    }
+    size_t off = g_api.field_get_offset(f);
+    Il2CppObject* v = *(Il2CppObject**)((char*)sd + (ptrdiff_t)off);
+    if (!v && why && whySize) snprintf(why, whySize, "value null");
+    return v;
+}
+
+/**
+ * 返回 SimplePlayerPrefs 当前的 AES 密钥字符串。
+ * 返回以 "ERR" 开头表示失败。
+ */
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_kunpo_crack_NativeBridge_nativePrefsKey(JNIEnv* env, jclass clazz) {
+    if (!ensure_lib()) {
+        return mk(env, "ERR libil2cpp.so not loaded");
+    }
+    if (!resolve_all()) {
+        return mk(env, "ERR il2cpp symbol resolve failed");
+    }
+    Il2CppDomain* dom = g_api.domain_get();
+    if (!dom) {
+        return mk(env, "WAIT il2cpp domain not ready");
+    }
+    g_api.thread_attach(dom);
+
+    Il2CppClass* k = find_class_ns_name(dom, "Arvin.PlayerPrefsUtilities", "SimplePlayerPrefs");
+    if (!k) {
+        return mk(env, "ERR class Arvin.PlayerPrefsUtilities.SimplePlayerPrefs not found");
+    }
+
+    char why[128];
+    why[0] = '\0';
+    Il2CppObject* keyObj = read_static_field_obj(k, "key", why, sizeof(why));
+    if (!keyObj) {
+        char o[256];
+        snprintf(o, sizeof(o), "ERR key field unreadable (%s)", why);
+        return mk(env, o);
+    }
+
+    int32_t len = str_len(keyObj);
+    if (len < 0 || len > 512) {
+        char o[128];
+        snprintf(o, sizeof(o), "ERR key length abnormal: %d", len);
+        return mk(env, o);
+    }
+    const uint16_t* ch = str_chars(keyObj);
+    size_t cap = (size_t)len * 4 + 8;
+    char* buf = (char*)malloc(cap);
+    if (!buf) {
+        return mk(env, "ERR oom");
+    }
+    utf16_to_utf8(ch, len, buf, (int)cap);
+    NLOGI("SimplePlayerPrefs.key = [%s] (len=%d)", buf, len);
+    jstring r = mk(env, buf);
+    free(buf);
+    return r;
+}
