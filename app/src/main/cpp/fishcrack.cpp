@@ -1249,12 +1249,17 @@ Java_com_kunpo_crack_NativeBridge_nativeDumpKey(JNIEnv* env, jclass clazz) {
         // name / offset / 当前值打出来，用来确认 provider 到底落在哪个 offset。
         if (g_api.class_get_fields && g_api.field_get_name) {
             void* sdDbg = g_api.class_get_static_field_data(sp);
-            FieldInfo* const* flds = g_api.class_get_fields(sp, nullptr);
-            for (int fi = 0; flds && flds[fi] && fi < 32; ++fi) {
-                const char* fn = g_api.field_get_name(flds[fi]);
-                const size_t fo = g_api.field_get_offset(flds[fi]);
+            // il2cpp_class_get_fields 是迭代器式：每次传同一个 iter，返回下一个
+            // FieldInfo*，直到 NULL。不是返回数组。
+            void* iter = nullptr;
+            FieldInfo* f = nullptr;
+            int fi = 0;
+            while ((f = g_api.class_get_fields(sp, &iter)) != nullptr && fi < 32) {
+                const char* fn = g_api.field_get_name(f);
+                const size_t fo = g_api.field_get_offset(f);
                 void* val = sdDbg ? *(void**)((char*)sdDbg + (ptrdiff_t)fo) : nullptr;
                 NLOGI("  [sp] field[%d] %s off=%zu value=%p", fi, fn ? fn : "?", fo, val);
+                ++fi;
             }
         }
         FieldInfo* fProv = g_api.class_get_field_from_name(sp, "provider");
