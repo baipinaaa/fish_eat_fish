@@ -765,6 +765,22 @@ Java_com_kunpo_crack_NativeBridge_nativeTryTriggerLogin(JNIEnv* env, jclass claz
         return mk(env, out);
     }
 
+    // ⚠️ 免登陆触发开关（默认关）。
+    //
+    // 实测到的完整链（见 work/README.md 第 8 节）：
+    //   Complete → KunpoAndroidLauncher.Login() → NetHelper.Login(deviceId)
+    //   → 服务端下发 token → SetNetConfigByLogin() 才能填 NetworkConfig.*
+    // 也就是说 Complete 的 lambda 本身又走一次网络验证，绕不过服务端；
+    // 而且在这个 runtime_invoke 栈里启动 UniTask 状态机，真机会直接
+    // SIGTRAP (signal 5, SI_QUEUE，栈顶就是 libfishcrack)。
+    // 所以默认只读取 + 报告，不触发。
+    static const bool kAutoTriggerComplete = false;
+    if (!kAutoTriggerComplete) {
+        snprintf(out, sizeof(out),
+                 "SKIP Complete delegate present but auto-trigger disabled (%s)", why);
+        return mk(env, out);
+    }
+
     // 首选：调游戏自己的 CompleteInvoke()（protected static void, 0 参数）。
     //   il2cpp_runtime_invoke 不做访问检查，protected 可直接调。
     //   它做的是 Complete?.Invoke() + Complete=null，比我们手动 Invoke 更贴合

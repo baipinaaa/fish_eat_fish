@@ -559,6 +559,15 @@ public final class NativeBridge {
                 XposedBridge.log(TAG + ": ===== 免登陆触发成功：已代点“登录”，游戏将直接进入主流程 =====");
                 return;
             }
+            // SKIP = native 侧检测到 Complete 委托已存在，但自动触发被开关关闭
+            // （实测那条链最终仍要向服务器要 token，绕不过服务端验证，
+            //  且在 runtime_invoke 栈里启动 UniTask 会把游戏打成 SIGTRAP）。
+            // 既然已经拿到确定结论，就不再轮询，避免干扰游戏主线程。
+            if (r.startsWith("SKIP")) {
+                triggered = true;
+                XposedBridge.log(TAG + ": ===== 诊断结束，自动触发已关闭：" + r);
+                return;
+            }
             main().postDelayed(this, INTERVAL_MS);
         }
     }
