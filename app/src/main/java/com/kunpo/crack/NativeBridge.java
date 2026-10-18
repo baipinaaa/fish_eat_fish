@@ -86,6 +86,36 @@ public final class NativeBridge {
         }
     }
 
+    /**
+     * 后台每 3 秒试一次 dumpKey，拿到 OK 就停。
+     *
+     * 原因：SimplePlayerPrefs.provider 在第一次 Encrypt/Decrypt 之前是 null，
+     * 必须等游戏真正把存档读进来（登录完成、进主界面）才有值。
+     * 真机实测：停在登录页时 provider=0x0（staticData 正常，off=8）。
+     */
+    private static void startKeyDumpLoop() {
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                for (int i = 1; i <= 120; i++) {
+                    try {
+                        Thread.sleep(3000);
+                    } catch (Throwable ignored) {
+                        return;
+                    }
+                    String r = dumpKey();
+                    if (r != null && r.startsWith("OK count")) {
+                        XposedBridge.log(TAG + ": ===== 拿到 AES key（第 " + i + " 次尝试）=====");
+                        return;
+                    }
+                }
+                XposedBridge.log(TAG + ": key dump 超时（6 分钟）放弃");
+            }
+        }, "FishCrack-keydump");
+        t.setDaemon(true);
+        t.start();
+    }
+
     /** 取当前存档 AES 密钥。返回以 "ERR" 开头表示失败。 */
     public static String prefsKey() {
         if (!libLoaded) {
@@ -707,6 +737,8 @@ public final class NativeBridge {
                 XposedBridge.log(TAG + ": ===== 诊断结束，自动触发已关闭：" + r);
                 // il2cpp 到这里肯定就绪了，正好把存档解密出来看看钻石存在哪
                 dumpPrefs();
+                // provider 要等游戏真正读存档才会创建，延迟轮询拿 AES key
+                startKeyDumpLoop();
                 return;
             }
             main().postDelayed(this, INTERVAL_MS);

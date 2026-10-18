@@ -1245,6 +1245,18 @@ Java_com_kunpo_crack_NativeBridge_nativeDumpKey(JNIEnv* env, jclass clazz) {
     // ---- 路径 A：静态字段 provider（HybridCLR 类可能读不到，仅先试） ----
     Il2CppClass* sp = find_class_ns_name(dom, "Arvin.PlayerPrefsUtilities", "SimplePlayerPrefs");
     if (sp) {
+        // HybridCLR 解释类的 static_fields 布局和原生不同，先把全部字段的
+        // name / offset / 当前值打出来，用来确认 provider 到底落在哪个 offset。
+        if (g_api.class_get_fields && g_api.field_get_name) {
+            void* sdDbg = g_api.class_get_static_field_data(sp);
+            FieldInfo* const* flds = g_api.class_get_fields(sp, nullptr);
+            for (int fi = 0; flds && flds[fi] && fi < 32; ++fi) {
+                const char* fn = g_api.field_get_name(flds[fi]);
+                const size_t fo = g_api.field_get_offset(flds[fi]);
+                void* val = sdDbg ? *(void**)((char*)sdDbg + (ptrdiff_t)fo) : nullptr;
+                NLOGI("  [sp] field[%d] %s off=%zu value=%p", fi, fn ? fn : "?", fo, val);
+            }
+        }
         FieldInfo* fProv = g_api.class_get_field_from_name(sp, "provider");
         void* sd = g_api.class_get_static_field_data(sp);
         NLOGI("SimplePlayerPrefs staticData=%p field_provider=%p", sd, (void*)fProv);
