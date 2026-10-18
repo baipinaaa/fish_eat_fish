@@ -48,6 +48,11 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <elf.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 
 #define LOGTAG "FishCrack-Native"
 #define NLOGI(...) __android_log_print(ANDROID_LOG_INFO, LOGTAG, __VA_ARGS__)
@@ -116,6 +121,171 @@ static bool g_resolved = false;
 static Il2CppClass* g_cached_target = nullptr;
 static int g_scan_ticks = 0;
 
+// ---------------------------------------------------------------------------
+// namespace 隔离的兼底方案
+//
+// 问题（真机日志坐实）：LSPosed 会把模块的 .so 装进一个隔离 namespace（日志
+// 里的 `using isolated ns clns-10`），而游戏的 libil2cpp.so 在应用自己的
+// namespace 里。于是 `dlopen("libil2cpp.so")` 必然失败 —— 哪怕
+// /proc/self/maps 里明明映射了 6 段。
+//
+// 解法：完全绕开 dlopen/dlsym。从 /proc/self/maps 拿到 libil2cpp.so 的加载
+// 基址，再自己读 ELF 的 .dynsym/.dynstr 算符号地址（ET_DYN 的 st_value 就是
+// 相对基址的偏移）。namespace 再怎么隔离都拦不住直接读内存。
+// ---------------------------------------------------------------------------
+
+struct SoImage {
+    void* base;
+    char path[512];
+};
+
+static SoImage g_il2cpp_img;
+static void* g_elf_map = nullptr;      // mmap 缓存（libil2cpp.so 很大，只映射一次）
+static size_t g_elf_map_size = 0;
+
+static bool find_so_in_maps(const char* needle, SoImage* out) {
+    FILE* fp = fopen("/proc/self/maps", "r");
+    if (!fp) {
+        return false;
+    }
+    char line[1024];
+    bool got = false;
+    while (fgets(line, sizeof(line), fp)) {
+        if (!strstr(line, needle)) {
+            continue;
+        }
+        unsigned long start = 0, off = 0;
+        char perms[8] = {0};
+        char path[512] = {0};
+        if (sscanf(line, "%lx-%*lx %7s %lx %*s %*s %511s", &start, perms, &off, path) != 4) {
+            continue;
+        }
+        if (path[0] != '/') {
+            continue;
+        }
+        if (off == 0) {
+            // 文件头所在段：这里的 start 就是加载基址
+            out->base = (void*)start;
+            strncpy(out->path, path, sizeof(out->path) - 1);
+            got = true;
+            break;
+        }
+        if (!got) {
+            // maps 的 offset 列已经是字节偏移，不用乘页大小
+            out->base = (void*)(start - off);
+            strncpy(out->path, path, sizeof(out->path) - 1);
+            got = true;
+        }
+    }
+    fclose(fp);
+    return got;
+}
+
+static void* elf_lookup(const SoImage* img, const char* name) {
+    if (!img->base || img->path[0] == '\0') {
+        return nullptr;
+    }
+    if (!g_elf_map) {
+        int fd = open(img->path, O_RDONLY);
+        if (fd < 0) {
+            NLOGE("open(%s) failed", img->path);
+            return nullptr;
+        }
+        struct stat st;
+        if (fstat(fd, &st) != 0 || st.st_size < (off_t)sizeof(Elf64_Ehdr)) {
+            close(fd);
+            return nullptr;
+        }
+        void* m = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+        if (m == MAP_FAILED) {
+            NLOGE("mmap(%s) failed", img->path);
+            return nullptr;
+        }
+        g_elf_map = m;
+        g_elf_map_size = (size_t)st.st_size;
+    }
+
+    const unsigned char* m = (const unsigned char*)g_elf_map;
+    const Elf64_Ehdr* eh = (const Elf64_Ehdr*)m;
+    if (eh->e_ident[EI_CLASS] != ELFCLASS64 || eh->e_shoff == 0 || eh->e_shnum == 0) {
+        return nullptr;
+    }
+    if ((size_t)eh->e_shoff + (size_t)eh->e_shnum * sizeof(Elf64_Shdr) > g_elf_map_size) {
+        return nullptr;
+    }
+    const Elf64_Shdr* sh = (const Elf64_Shdr*)(m + eh->e_shoff);
+    const char* shstr = (const char*)(m + sh[eh->e_shstrndx].sh_offset);
+
+    const Elf64_Shdr* dynsym = nullptr;
+    const char* dynstr = nullptr;
+    for (int i = 0; i < eh->e_shnum; i++) {
+        if (sh[i].sh_type == SHT_DYNSYM) {
+            dynsym = &sh[i];
+        } else if (sh[i].sh_name && strcmp(shstr + sh[i].sh_name, ".dynstr") == 0) {
+            dynstr = (const char*)(m + sh[i].sh_offset);
+        }
+    }
+    if (!dynsym || !dynstr) {
+        NLOGE("elf_lookup: no .dynsym/.dynstr in %s", img->path);
+        return nullptr;
+    }
+
+    const Elf64_Sym* syms = (const Elf64_Sym*)(m + dynsym->sh_offset);
+    size_t count = (size_t)(dynsym->sh_size / sizeof(Elf64_Sym));
+    for (size_t i = 0; i < count; i++) {
+        const char* sn = dynstr + syms[i].st_name;
+        if (strcmp(sn, name) == 0 && syms[i].st_value != 0) {
+            return (char*)img->base + syms[i].st_value;
+        }
+    }
+    return nullptr;
+}
+
+static bool ensure_lib() {
+    if (g_api.handle) {
+        return true;
+    }
+    void* h = dlopen("libil2cpp.so", RTLD_NOW);
+    if (!h) {
+        h = dlopen("libil2cpp.so", RTLD_LAZY);
+    }
+    if (h) {
+        g_api.handle = h;
+        NLOGI("libil2cpp.so loaded via dlopen, handle=%p", h);
+        return true;
+    }
+    NLOGI("dlopen(libil2cpp.so) failed (%s) -> 走 /proc/self/maps + ELF 手工解析",
+          dlerror());
+    if (find_so_in_maps("libil2cpp.so", &g_il2cpp_img)) {
+        NLOGI("maps: libil2cpp.so base=%p path=%s", g_il2cpp_img.base, g_il2cpp_img.path);
+        return true;
+    }
+    NLOGE("maps 里也找不到 libil2cpp.so");
+    return false;
+}
+
+static bool bind_one(void* slot, const char* name) {
+    void* p = nullptr;
+    if (g_api.handle) {
+        p = dlsym(g_api.handle, name);
+    }
+    if (!p) {
+        p = elf_lookup(&g_il2cpp_img, name);
+    }
+    if (!p) {
+        p = dlsym(RTLD_DEFAULT, name);
+    }
+    if (!p) {
+        NLOGE("resolve(%s) failed", name);
+        return false;
+    }
+    // 函数指针与数据指针在 AArch64/ARM 上都是指针宽度，用 memcpy 避免
+    // (void**)(fnptr*) 这种退化转换带来的 UB / 警告。
+    memcpy(slot, &p, sizeof(void*));
+    return true;
+}
+
 // 目标类（热更 DLL 里的登录 UI 类）
 static const char* kTargetNs = "KunpoUserSystem_FGUI";
 static const char* kTargetClass = "UserSystemWindow";
@@ -128,36 +298,8 @@ static const char* kCompleteField = "<Complete>k__BackingField";
 static const char* kCompleteInvoke = "CompleteInvoke";
 
 // ---------------------------------------------------------------------------
-// 绑定
+// 绑定（ensure_lib / bind_one 见文件上方：已改为 dlopen + maps/ELF 双路径）
 // ---------------------------------------------------------------------------
-static bool ensure_lib() {
-    if (g_api.handle) {
-        return true;
-    }
-    void* h = dlopen("libil2cpp.so", RTLD_NOW);
-    if (!h) {
-        h = dlopen("libil2cpp.so", RTLD_LAZY);
-    }
-    if (!h) {
-        return false;
-    }
-    g_api.handle = h;
-    NLOGI("libil2cpp.so loaded, handle=%p", h);
-    return true;
-}
-
-static bool bind_one(void* slot, const char* name) {
-    void* p = dlsym(g_api.handle, name);
-    if (!p) {
-        NLOGE("dlsym(%s) failed: %s", name, dlerror());
-        return false;
-    }
-    // 函数指针与数据指针在 AArch64/ARM 上都是指针宽度，用 memcpy 避免
-    // (void**)(fnptr*) 这种退化转换带来的 UB / 警告。
-    memcpy(slot, &p, sizeof(void*));
-    return true;
-}
-
 #define BIND(field, sym)                                       \
     do {                                                       \
         if (!bind_one(&g_api.field, sym)) return false;         \

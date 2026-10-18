@@ -51,6 +51,8 @@ public final class NativeBridge {
     private static volatile boolean loading;
     private static volatile int attempts;
     private static volatile String lastStatus = "";
+    /** 宿主（游戏）的 ClassLoader：用来把模块 .so 加载进宿主 namespace。 */
+    private static volatile ClassLoader hostCl;
 
     private NativeBridge() {
     }
@@ -68,6 +70,7 @@ public final class NativeBridge {
         if (!CrackConfig.AUTO_LOGIN) {
             return;
         }
+        hostCl = hostClassLoader;
         XposedBridge.log(TAG + ": 免登陆已启用，等待 Application#attach 拿 Context");
 
         // 主路径：hook Application#attach —— 这段时间就在 Application 创建之前，
@@ -217,6 +220,36 @@ public final class NativeBridge {
     }
 
     /** System.load 包一层：失败不抛、只记日志，方便逐条路径试。 */
+    /**
+     * 用宿主（游戏）自己的 ClassLoader 去 load 模块的 .so。
+     *
+     * 为什么需要：LSPosed 注入时会把模块 .so 装进一个隔离 namespace
+     * （真机日志：{@code Load ... using isolated ns clns-10}），那里看不到游戏
+     * 自己的 libil2cpp.so，于是 native 侧的 dlopen("libil2cpp.so") 必然失败。
+     * Runtime.load0(ClassLoader, String) 能把 namespace 指定为传入 ClassLoader
+     * 所在的那个（即应用 default namespace）。
+     */
+    private static boolean loadWithHostClassLoader(String path) {
+        ClassLoader cl = hostCl;
+        if (cl == null) {
+            return false;
+        }
+        for (String m : new String[]{"load0", "loadLibrary0"}) {
+            try {
+                Method mm = Runtime.class.getDeclaredMethod(m, ClassLoader.class, String.class);
+                mm.setAccessible(true);
+                mm.invoke(Runtime.getRuntime(), cl, path);
+                return true;
+            } catch (NoSuchMethodException e) {
+                continue;
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + ": Runtime." + m + "(hostCl) 失败 -> " + t);
+                return false;
+            }
+        }
+        return false;
+    }
+
     private static boolean tryLoad(String path, String how) {
         if (path == null) {
             return false;
@@ -226,10 +259,20 @@ public final class NativeBridge {
             XposedBridge.log(TAG + ": [" + how + "] 不存在: " + path);
             return false;
         }
+        // 首选宿主 namespace：只有这样 dlopen("libil2cpp.so") 才看得见游戏的 so
+        try {
+            if (loadWithHostClassLoader(path)) {
+                libLoaded = true;
+                XposedBridge.log(TAG + ": loaded via " + how + " (host namespace): " + path);
+                return true;
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": [" + how + "] host-ns load 异常 -> " + t);
+        }
         try {
             System.load(path);
             libLoaded = true;
-            XposedBridge.log(TAG + ": loaded via " + how + ": " + path);
+            XposedBridge.log(TAG + ": loaded via " + how + " (module namespace): " + path);
             return true;
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": [" + how + "] load 失败 -> " + t);
