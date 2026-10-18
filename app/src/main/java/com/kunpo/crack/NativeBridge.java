@@ -40,7 +40,11 @@ public final class NativeBridge {
     private static final String LIB_FILE = "libfishcrack.so";
 
     private static final long FIRST_DELAY_MS = 3000L;
-    private static final long INTERVAL_MS = 400L;
+    /**
+     * 每次尝试的间隔。原先 400ms 太密：登录界面停留时会长达十分钟不停
+     * 调 il2cpp，既不安全也看不出日志。
+     */
+    private static final long INTERVAL_MS = 800L;
     /** 400ms * 1500 ≈ 10 分钟；登录界面通常几秒内就出现。 */
     private static final int MAX_ATTEMPTS = 1500;
 

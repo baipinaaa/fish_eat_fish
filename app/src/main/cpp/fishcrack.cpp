@@ -90,6 +90,10 @@ typedef void (*pfn_gc_foreach_heap)(void (*)(void*, void*), void*);
 typedef Il2CppClass* (*pfn_class_get_parent)(Il2CppClass*);
 // void il2cpp_class_for_each(void (*klassCallback)(Il2CppClass*, void*), void* userData)
 typedef void (*pfn_class_for_each)(void (*)(Il2CppClass*, void*), void*);
+// 字段枚举。il2cpp_class_get_field_from_name 在新版 il2cpp 已被移除（真机
+// dlsym 拿不到），所以只能 class_get_fields + field_get_name 手工匹配名字。
+typedef FieldInfo* (*pfn_class_get_fields)(Il2CppClass*, void**);
+typedef const char* (*pfn_field_get_name)(FieldInfo*);
 
 struct Il2CppApi {
     void* handle;
@@ -111,6 +115,8 @@ struct Il2CppApi {
     pfn_gc_foreach_heap gc_foreach_heap;
     pfn_class_get_parent class_get_parent;
     pfn_class_for_each class_for_each;
+    pfn_class_get_fields class_get_fields;
+    pfn_field_get_name field_get_name;
 };
 
 static Il2CppApi g_api;
@@ -295,6 +301,23 @@ static bool ensure_lib() {
     return false;
 }
 
+// 可选符号解析：handle → 手工 ELF 解析 → 全局默认，三级兜底。
+//
+// 坑（真机坐实）：走 maps/ELF 路径时 g_api.handle 恒为 NULL，而那些“只用于
+// 诊断”的符号当初只写了 dlsym(g_api.handle, ...)，于是它们全部静默失败。
+// 症状：why 恒为空（路径 B 根本进不去）、class_get_image 拿不到 image 名，
+// 于是 AOT 空壳类与 HybridCLR 热更真类无法区分。
+static void* resolve_opt(const char* name) {
+    void* p = g_api.handle ? dlsym(g_api.handle, name) : nullptr;
+    if (!p) {
+        p = elf_lookup(&g_il2cpp_img, name);
+    }
+    if (!p) {
+        p = dlsym(RTLD_DEFAULT, name);
+    }
+    return p;
+}
+
 static bool bind_one(void* slot, const char* name) {
     void* p = nullptr;
     if (g_api.handle) {
@@ -352,21 +375,23 @@ static bool resolve_all() {
     BIND(field_get_offset, "il2cpp_field_get_offset");
     BIND(class_get_static_field_data, "il2cpp_class_get_static_field_data");
 
-    // 下面几个只用于诊断 / 兜底，缺了也能跑
-    g_api.class_get_image =
-        (pfn_class_get_image)dlsym(g_api.handle, "il2cpp_class_get_image");
-    g_api.class_get_name =
-        (pfn_class_get_name)dlsym(g_api.handle, "il2cpp_class_get_name");
+    // 下面几个只用于诊断 / 兜底，缺了也能跑。
+    // 必须走 resolve_opt：maps/ELF 路径下 g_api.handle 是 NULL。
+    g_api.class_get_image = (pfn_class_get_image)resolve_opt("il2cpp_class_get_image");
+    g_api.class_get_name = (pfn_class_get_name)resolve_opt("il2cpp_class_get_name");
     g_api.class_get_namespace =
-        (pfn_class_get_namespace)dlsym(g_api.handle, "il2cpp_class_get_namespace");
-    g_api.class_get_field_from_name = (pfn_class_get_field_from_name)dlsym(
-        g_api.handle, "il2cpp_class_get_field_from_name");
-    g_api.gc_foreach_heap =
-        (pfn_gc_foreach_heap)dlsym(g_api.handle, "il2cpp_gc_foreach_heap");
-    g_api.class_get_parent =
-        (pfn_class_get_parent)dlsym(g_api.handle, "il2cpp_class_get_parent");
-    g_api.class_for_each =
-        (pfn_class_for_each)dlsym(g_api.handle, "il2cpp_class_for_each");
+        (pfn_class_get_namespace)resolve_opt("il2cpp_class_get_namespace");
+    g_api.class_get_field_from_name =
+        (pfn_class_get_field_from_name)resolve_opt("il2cpp_class_get_field_from_name");
+    g_api.gc_foreach_heap = (pfn_gc_foreach_heap)resolve_opt("il2cpp_gc_foreach_heap");
+    g_api.class_get_parent = (pfn_class_get_parent)resolve_opt("il2cpp_class_get_parent");
+    g_api.class_for_each = (pfn_class_for_each)resolve_opt("il2cpp_class_for_each");
+    g_api.class_get_fields = (pfn_class_get_fields)resolve_opt("il2cpp_class_get_fields");
+    g_api.field_get_name = (pfn_field_get_name)resolve_opt("il2cpp_field_get_name");
+    NLOGI("optional symbols: image=%p name=%p fields=%p field_name=%p field_by_name=%p",
+          (void*)g_api.class_get_image, (void*)g_api.class_get_name,
+          (void*)g_api.class_get_fields, (void*)g_api.field_get_name,
+          (void*)g_api.class_get_field_from_name);
 
     // 最后一道保险：确认关键函数所在页确实可执行。
     // 地址算对但页还是 r--p 时直接调用 = SIGSEGV，游戏当场闪退。
@@ -392,6 +417,30 @@ static jstring mk(JNIEnv* env, const char* s) {
 }
 
 // 遍历所有 image 找类；顺带把 image 名列进 diag（最多留 700 字符）
+// 把类的字段名全打出来。用途：判断 native 拿到的 klass 到底是 AOT 空壳
+// （Assembly-CSharp.dll，HybridCLR 的 DummyDll，方法体全是 trap 桩）还是热更后
+// 的真类（Logic.dll）——两者的静态字段是完全独立的两份内存。
+static void dump_class_fields(Il2CppClass* klass) {
+    if (!g_api.class_get_fields || !g_api.field_get_name) {
+        NLOGI("  [dump] class_get_fields 未绑定，跳过字段枚举");
+        return;
+    }
+    void* iter = nullptr;
+    int i = 0;
+    for (;;) {
+        FieldInfo* f = g_api.class_get_fields(klass, &iter);
+        if (!f) {
+            break;
+        }
+        const char* nm = g_api.field_get_name(f);
+        NLOGI("  [dump] field[%d] %s", i, nm ? nm : "?");
+        if (++i >= 60) {
+            break;
+        }
+    }
+    NLOGI("  [dump] %d fields on %s", i, kTargetClass);
+}
+
 static Il2CppClass* find_class_in_images(Il2CppDomain* dom, size_t* outCount, char* diag, size_t diagSize) {
     size_t n = 0;
     const Il2CppAssembly** asms = g_api.domain_get_assemblies(dom, &n);
@@ -424,6 +473,10 @@ static Il2CppClass* find_class_in_images(Il2CppDomain* dom, size_t* outCount, ch
             Il2CppClass* k = g_api.class_from_name(img, kTargetNs, kTargetClass);
             if (k) {
                 found = k;
+                const char* inm = g_api.image_get_name ? g_api.image_get_name(img) : nullptr;
+                NLOGI("target class %s.%s hit in image=%s klass=%p", kTargetNs, kTargetClass,
+                      inm ? inm : "?", k);
+                dump_class_fields(k);
             }
         }
         if (found && used + 80 >= diagSize) {
@@ -546,8 +599,15 @@ static Il2CppObject* read_complete_delegate(Il2CppClass* klass, char* why, size_
     Il2CppObject* exc = nullptr;
 
     // 路径 A：调用属性 getter（最“正当”，无副作用）
-    const MethodInfo* getter =
-        g_api.class_get_method_from_name(klass, kCompleteGetter, 0);
+    //
+    // ⚠️ 安全开关：HybridCLR 的 AOT 空壳（Assembly-CSharp.dll 的 DummyDll）
+    // 里方法体是 trap 桩，一旦 klass 命中的是空壳，runtime_invoke 会当场把游戏
+    // 打成 SIGTRAP（真机已复现：signal 5 SI_QUEUE）。所以默认只走纯内存读
+    // （读字段/静态块不可能 trap），待 image 名与字段清单确认后再打开。
+    static const bool kAllowInvokeGetter = false;
+    const MethodInfo* getter = (!kAllowInvokeGetter || !g_api.class_get_method_from_name)
+                                  ? nullptr
+                                  : g_api.class_get_method_from_name(klass, kCompleteGetter, 0);
     if (getter) {
         Il2CppObject* del = g_api.runtime_invoke(getter, nullptr, nullptr, &exc);
         if (exc) {
@@ -562,11 +622,26 @@ static Il2CppObject* read_complete_delegate(Il2CppClass* klass, char* why, size_
     }
 
     // 路径 B：直接读静态 backing field（HybridCLR 的静态字段同样落在
-    //         Il2CppClass::static_fields 里）
-    if (!g_api.class_get_field_from_name) {
-        return nullptr;
+    //         Il2CppClass::static_fields 里）。
+    // 优先用 class_get_fields 手工匹配：il2cpp_class_get_field_from_name
+    // 在新版 il2cpp 已被移除，真机 dlsym 拿不到。
+    FieldInfo* f = nullptr;
+    if (g_api.class_get_fields && g_api.field_get_name) {
+        void* iter = nullptr;
+        for (;;) {
+            FieldInfo* cand = g_api.class_get_fields(klass, &iter);
+            if (!cand) {
+                break;
+            }
+            const char* nm = g_api.field_get_name(cand);
+            if (nm && strcmp(nm, kCompleteField) == 0) {
+                f = cand;
+                break;
+            }
+        }
+    } else if (g_api.class_get_field_from_name) {
+        f = g_api.class_get_field_from_name(klass, kCompleteField);
     }
-    FieldInfo* f = g_api.class_get_field_from_name(klass, kCompleteField);
     if (!f) {
         if (why && whySize) {
             strncat(why, "backing field not found", whySize - strlen(why) - 1);
