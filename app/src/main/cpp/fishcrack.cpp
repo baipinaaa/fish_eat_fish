@@ -34,15 +34,20 @@
 //   就是 Unity 主线程。
 // ---------------------------------------------------------------------------
 
+// 本模块刻意不依赖 C++ 标准库（build.gradle 传 -DANDROID_STL=none，NDK 会加
+// -nostdinc++ 屏蔽 C++ 头，好处是最终 .so 不链接 libc++_static）：
+// 所以这里只能用 C 头，不能写 <cstddef>/<cstdint>/<cstdio>/<cstring>，
+// 对应的 C 写法是 <stddef.h>/<stdint.h>/<stdio.h>/<string.h>，
+// 且所有符号都是全局命名空间（snprintf / memcpy / strcmp ...，不能带 std::）。
 #include <jni.h>
 #include <android/log.h>
 #include <dlfcn.h>
 #include <unistd.h>
 
-#include <cstddef>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
 
 #define LOGTAG "FishCrack-Native"
 #define NLOGI(...) __android_log_print(ANDROID_LOG_INFO, LOGTAG, __VA_ARGS__)
