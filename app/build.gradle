@@ -5,6 +5,8 @@ plugins {
 android {
     namespace 'com.kunpo.crack'
     compileSdk 34
+    // 与 CI（.github/workflows/build.yml）安装的 NDK 保持一致
+    ndkVersion '26.1.10909125'
 
     defaultConfig {
         applicationId "com.kunpo.crack"
@@ -12,6 +14,25 @@ android {
         targetSdk 34
         versionCode 1
         versionName "1.0"
+
+        ndk {
+            // 游戏只提供这两个 ABI：lib/arm64-v8a、lib/armeabi-v7a
+            abiFilters 'arm64-v8a', 'armeabi-v7a'
+        }
+
+        externalNativeBuild {
+            cmake {
+                arguments '-DANDROID_STL=none'
+                cppFlags '-std=c++17'
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path file('src/main/cpp/CMakeLists.txt')
+            version '3.22.1'
+        }
     }
 
     buildTypes {
@@ -37,6 +58,12 @@ android {
     packaging {
         resources {
             excludes += ['META-INF/*.kotlin_module']
+        }
+        jniLibs {
+            // 把 .so 解压出来：NativeBridge 的第 1 条加载路径
+            // （ApplicationInfo.nativeLibraryDir + System.load）依赖它，
+            // 否则 Android 10 以下拿不到可 load 的真实文件。
+            useLegacyPackaging = true
         }
     }
 }

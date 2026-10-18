@@ -36,6 +36,16 @@ public final class CrackConfig {
     /** 拦掉 PlayerPrefs.DeleteAll()/Editor.clear()（反封号兜底） */
     public static final boolean BLOCK_WIPE = true;
 
+    /**
+     * 免登陆：自动调用热更层 UserSystemWindow.Complete 静态委托（等价于替玩家点了「登录」），
+     * 跳过微信授权与登录界面等待。
+     *
+     * 纯 Java 的 Xposed hook 摸不到热更 DLL 里的 C# 方法，所以这条靠 native 实现：
+     * NativeBridge 用 Handler(主线程) 轮询，libfishcrack.so 通过 il2cpp C API
+     * 直接 invoke 那个 Action 委托 —— 详见 work/README.md 第 7 节。
+     */
+    public static final boolean AUTO_LOGIN = true;
+
     // ------------------------------------------------------------------
     // 数值目标
     // ------------------------------------------------------------------

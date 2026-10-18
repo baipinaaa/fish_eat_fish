@@ -120,6 +120,13 @@ public class CrackHook implements IXposedHookLoadPackage {
             }, String.class);
         }
 
+        // 5) 免登陆：native 驱动热更层 UserSystemWindow.Complete（跳过微信登录）
+        try {
+            NativeBridge.install(cl);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": NativeBridge.install failed -> " + t);
+        }
+
         XposedBridge.log(TAG + ": hooks installed");
     }
 

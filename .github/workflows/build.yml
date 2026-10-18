@@ -48,10 +48,17 @@ jobs:
           echo "using sdkmanager: $SDKMANAGER"
 
           yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
-          "$SDKMANAGER" --install "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+          # 除了 SDK，还要装 NDK + CMake —— 免登陆那一半是 native 代码
+          # （app/src/main/cpp/fishcrack.cpp），要靠它们编出 libfishcrack.so。
+          # 版本必须与 app/build.gradle 里的 ndkVersion / externalNativeBuild.cmake.version 对上。
+          "$SDKMANAGER" --install "platform-tools" "platforms;android-34" "build-tools;34.0.0" \
+                         "ndk;26.1.10909125" "cmake;3.22.1"
 
           ls "$ANDROID_HOME/platforms"
           ls "$ANDROID_HOME/build-tools"
+          ls "$ANDROID_HOME/ndk"
+          ls "$ANDROID_HOME/cmake"
 
       - name: Set up Gradle 8.5
         uses: gradle/actions/setup-gradle@v4
